@@ -1,0 +1,273 @@
+//! Backend heartbeat connection.
+//!
+//! The backend receives JSON encoded in binary WebSocket frames.
+//! Incoming application messages are observed but are not executed as
+//! hardware commands; the supplied C client only prints those messages.
+
+use crate::{
+    error::{AppError, AppResult},
+    metrics::MetricSampler,
+    state::AppState,
+};
+
+use futures::{SinkExt, StreamExt};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+use tokio::{
+    net::TcpStream,
+    time::{self, Instant, MissedTickBehavior},
+};
+
+use tokio_tungstenite::{
+    connect_async_with_config,
+    tungstenite::{
+        client::IntoClientRequest,
+        http::{header::SEC_WEBSOCKET_PROTOCOL, HeaderValue},
+        protocol::WebSocketConfig,
+        Message,
+    },
+    MaybeTlsStream, WebSocketStream,
+};
+
+use tracing::{debug, info, warn};
+
+type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+const SUBPROTOCOL: &str = "web-cli-protocol";
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+const PONG_TIMEOUT: Duration = Duration::from_secs(70);
+
+async fn send(socket: &mut Socket, message: Message) -> AppResult<()> {
+    time::timeout(WRITE_TIMEOUT, socket.send(message))
+        .await
+        .map_err(|_| AppError::Msg("WebSocket write timed out".into()))?
+        .map_err(|error| AppError::Msg(format!("WebSocket write failed: {error}")))
+}
+
+fn connection_request(
+    state: &AppState,
+    uid: &str,
+) -> AppResult<tokio_tungstenite::tungstenite::http::Request<()>> {
+    let mut url = reqwest::Url::parse(&format!(
+        "ws://{}:{}/ws",
+        state.cfg.server_ip, state.cfg.ws_port
+    ))
+    .map_err(|error| AppError::Msg(format!("invalid WebSocket URL: {error}")))?;
+
+    url.query_pairs_mut().append_pair("deviceControllerId", uid);
+
+    let mut request = url.as_str().into_client_request().map_err(|error| {
+        AppError::Msg(format!("WebSocket request construction failed: {error}"))
+    })?;
+
+    request.headers_mut().insert(
+        SEC_WEBSOCKET_PROTOCOL,
+        HeaderValue::from_static(SUBPROTOCOL),
+    );
+
+    Ok(request)
+}
+
+async fn connection_session(
+    state: &AppState,
+    uid: &str,
+    sampler: Arc<Mutex<MetricSampler>>,
+) -> AppResult<()> {
+    let request = connection_request(state, uid)?;
+
+    let mut config = WebSocketConfig::default();
+    config.max_message_size = Some(64 * 1024);
+    config.max_frame_size = Some(64 * 1024);
+
+    let (mut socket, response) = time::timeout(
+        CONNECT_TIMEOUT,
+        connect_async_with_config(request, Some(config), true),
+    )
+    .await
+    .map_err(|_| AppError::Msg("WebSocket connection timed out".into()))?
+    .map_err(|error| AppError::Msg(format!("WebSocket connection failed: {error}")))?;
+
+    // Some existing servers omit subprotocol selection. Permit omission,
+    // but reject an explicitly different protocol.
+    if let Some(selected) = response.headers().get(SEC_WEBSOCKET_PROTOCOL) {
+        if selected.as_bytes() != SUBPROTOCOL.as_bytes() {
+            return Err(AppError::Msg(
+                "backend selected an unexpected WebSocket subprotocol".into(),
+            ));
+        }
+    } else {
+        warn!("backend did not explicitly select the requested subprotocol");
+    }
+
+    info!("WebSocket connected");
+
+    let start = Instant::now() + HEARTBEAT_INTERVAL;
+    let mut heartbeat = time::interval_at(start, HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    // Inspect service shutdown and identity changes without waiting for
+    // the full heartbeat interval.
+    let mut lifecycle = time::interval(Duration::from_secs(1));
+    lifecycle.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    let mut last_pong = Instant::now();
+
+    loop {
+        tokio::select! {
+            _ = lifecycle.tick() => {
+                let shutting_down =
+                    state.jobs.is_closing() || *state.reboot.read().await;
+
+                let current_uid = state.controller.read().await.uid.clone();
+
+                if shutting_down || current_uid.as_deref() != Some(uid) {
+                    // Best-effort close. Dropping the stream also closes
+                    // the connection if the peer does not respond.
+                    let _ = send(&mut socket, Message::Close(None)).await;
+                    return Ok(());
+                }
+
+                if last_pong.elapsed() > PONG_TIMEOUT {
+                    return Err(AppError::Msg(
+                        "WebSocket pong deadline exceeded".into(),
+                    ));
+                }
+            }
+
+            _ = heartbeat.tick() => {
+                // Send ping independently of metrics availability.
+                send(&mut socket, Message::Ping(Vec::new().into())).await?;
+
+                let ip = state.controller.read().await.board_ip.clone();
+                let uid = uid.to_owned();
+                let sampler = sampler.clone();
+
+                let sampled = tokio::task::spawn_blocking(move || {
+                    let mut sampler = sampler.lock().map_err(|_| {
+                        AppError::Msg("metrics sampler mutex was poisoned".into())
+                    })?;
+
+                    sampler.heartbeat(uid, ip)
+                })
+                .await
+                .map_err(|error| {
+                    AppError::Msg(format!("metrics worker failed: {error}"))
+                })?;
+
+                match sampled {
+                    Ok(payload) => {
+                        let bytes = serde_json::to_vec(&payload)?;
+                        send(&mut socket, Message::Binary(bytes.into())).await?;
+                    }
+                    Err(error) => {
+                        // Keep the transport alive, but do not send a
+                        // fabricated successful metrics sample.
+                        warn!(%error, "heartbeat metrics unavailable");
+                    }
+                }
+            }
+
+            incoming = socket.next() => {
+                match incoming {
+                    Some(Ok(Message::Pong(_))) => {
+                        last_pong = Instant::now();
+                    }
+
+                    Some(Ok(Message::Ping(_))) => {
+                        // Tungstenite automatically queues a matching Pong
+                        // when it reads Ping. Flush that queued response;
+                        // do not send a duplicate explicit Pong.
+                        time::timeout(WRITE_TIMEOUT, socket.flush())
+                            .await
+                            .map_err(|_| {
+                                AppError::Msg("WebSocket pong flush timed out".into())
+                            })?
+                            .map_err(|error| {
+                                AppError::Msg(format!(
+                                    "WebSocket pong flush failed: {error}"
+                                ))
+                            })?;
+                    }
+
+                    Some(Ok(Message::Text(message))) => {
+                        // Avoid logging remote content or credentials.
+                        debug!(
+                            bytes = message.len(),
+                            "received backend text message"
+                        );
+                    }
+
+                    Some(Ok(Message::Binary(message))) => {
+                        debug!(
+                            bytes = message.len(),
+                            "received backend binary message"
+                        );
+                    }
+
+                    Some(Ok(Message::Close(_))) => {
+                        let _ = time::timeout(
+                            WRITE_TIMEOUT,
+                            socket.flush(),
+                        ).await;
+
+                        return Ok(());
+                    }
+
+                    Some(Ok(_)) => {}
+
+                    Some(Err(error)) => {
+                        return Err(AppError::Msg(format!(
+                            "WebSocket receive failed: {error}"
+                        )));
+                    }
+
+                    None => return Ok(()),
+                }
+            }
+        }
+    }
+}
+
+pub async fn websocket_loop(state: Arc<AppState>) {
+    let sampler = Arc::new(Mutex::new(MetricSampler::default()));
+    let mut retry_delay = Duration::from_secs(2);
+
+    loop {
+        if state.jobs.is_closing() || *state.reboot.read().await {
+            break;
+        }
+
+        let uid = state.controller.read().await.uid.clone();
+
+        let Some(uid) = uid.filter(|uid| !uid.is_empty()) else {
+            time::sleep(Duration::from_secs(1)).await;
+            continue;
+        };
+
+        let started = Instant::now();
+
+        if let Err(error) = connection_session(&state, &uid, sampler.clone()).await {
+            warn!(%error, "WebSocket session ended");
+        }
+
+        if state.jobs.is_closing() || *state.reboot.read().await {
+            break;
+        }
+
+        // Reset backoff after a reasonably stable connection. Repeated
+        // immediate failures otherwise back off to at most one minute.
+        if started.elapsed() >= Duration::from_secs(30) {
+            retry_delay = Duration::from_secs(2);
+        }
+
+        time::sleep(retry_delay).await;
+        retry_delay = (retry_delay * 2).min(Duration::from_secs(60));
+    }
+
+    info!("WebSocket service stopped");
+}
