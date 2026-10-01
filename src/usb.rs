@@ -154,6 +154,16 @@ fn inspect_tty(tty: String, device_path: PathBuf) -> AppResult<Option<UsbTty>> {
         let interface = interface
             .ok_or_else(|| AppError::Msg(format!("USB TTY {tty} has no interface descriptor")))?;
 
+        tracing::debug!(
+            tty = %tty,
+            vid,
+            pid,
+            serial = ?serial,
+            interface,
+            topology = %ancestor.display(),
+            "resolved USB TTY identity from sysfs"
+        );
+
         return Ok(Some(UsbTty {
             tty,
             vid,
@@ -164,6 +174,7 @@ fn inspect_tty(tty: String, device_path: PathBuf) -> AppResult<Option<UsbTty>> {
         }));
     }
 
+    tracing::debug!(tty = %tty, device_path = %device_path.display(), "no USB identity found for TTY node");
     Ok(None)
 }
 
@@ -198,17 +209,21 @@ fn scan_at(class_tty: &Path, dev_root: &Path) -> AppResult<Vec<UsbTty>> {
             .ok_or_else(|| AppError::Msg("non-UTF-8 device pathname".into()))?
             .to_owned();
 
-        if let Some(device) = inspect_tty(tty, device_path)? {
+        if let Some(device) = inspect_tty(tty.clone(), device_path)? {
             devices.push(device);
+        } else {
+            tracing::debug!(tty = %tty, "TTY node exists but did not resolve to a USB identity");
         }
     }
 
     devices.sort_unstable_by(|left, right| left.tty.cmp(&right.tty));
+    tracing::info!(scanned = devices.len(), "USB serial inventory scan completed");
     Ok(devices)
 }
 
 /// Enumerate USB serial ports whose /dev nodes currently exist.
 pub fn inventory() -> AppResult<Vec<UsbTty>> {
+    tracing::debug!("enumerating USB serial device inventory");
     let scanned = scan_at(Path::new("/sys/class/tty"), Path::new("/dev"))?;
     let mut devices = Vec::with_capacity(scanned.len());
 
@@ -218,6 +233,7 @@ pub fn inventory() -> AppResult<Vec<UsbTty>> {
                 devices.push(device);
             }
             Ok(_) => {
+                tracing::warn!(tty = %device.tty, "USB serial node exists but is not a character device");
                 return Err(AppError::Msg(format!(
                     "{} is not a character device",
                     device.tty
@@ -228,6 +244,7 @@ pub fn inventory() -> AppResult<Vec<UsbTty>> {
         }
     }
 
+    tracing::info!(device_count = devices.len(), "USB serial inventory collected");
     Ok(devices)
 }
 
@@ -237,6 +254,13 @@ fn select_identity(devices: &[UsbTty], identity: &UsbIdentity) -> AppResult<Stri
     let mut matches = devices.iter().filter(|device| identity.matches(device));
 
     let first = matches.next().ok_or_else(|| {
+        tracing::warn!(
+            vid = identity.vid,
+            pid = identity.pid,
+            serial = %identity.serial,
+            interface = identity.interface,
+            "requested USB identity is unavailable"
+        );
         AppError::Msg(format!(
             "USB device {:04x}:{:04x}, serial {:?}, interface {} unavailable",
             identity.vid, identity.pid, identity.serial, identity.interface
@@ -244,15 +268,37 @@ fn select_identity(devices: &[UsbTty], identity: &UsbIdentity) -> AppResult<Stri
     })?;
 
     if matches.next().is_some() {
+        tracing::warn!(
+            vid = identity.vid,
+            pid = identity.pid,
+            serial = %identity.serial,
+            interface = identity.interface,
+            "USB identity is ambiguous; refusing to select a device"
+        );
         return Err(AppError::Msg(
             "USB identity is ambiguous; refusing to select a device".into(),
         ));
     }
 
+    tracing::info!(
+        tty = %first.tty,
+        vid = identity.vid,
+        pid = identity.pid,
+        serial = %identity.serial,
+        interface = identity.interface,
+        "USB identity resolved to a live TTY"
+    );
     Ok(first.tty.clone())
 }
 
 pub fn resolve_identity(identity: &UsbIdentity) -> AppResult<String> {
+    tracing::debug!(
+        vid = identity.vid,
+        pid = identity.pid,
+        serial = %identity.serial,
+        interface = identity.interface,
+        "resolving USB identity to a device node"
+    );
     select_identity(&inventory()?, identity)
 }
 

@@ -53,16 +53,23 @@ static MAPPING_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// leak without introducing an additional authentication dependency.
 fn token_matches(expected: &[u8], supplied: &[u8]) -> bool {
     if expected.len() != supplied.len() {
+        debug!(expected_len = expected.len(), supplied_len = supplied.len(), "API token length mismatch");
         return false;
     }
 
-    expected
+    let matches = expected
         .iter()
         .zip(supplied)
         .fold(0_u8, |difference, (left, right)| {
             difference | (left ^ right)
         })
-        == 0
+        == 0;
+
+    if !matches {
+        debug!("API token bytes did not match; rejecting request");
+    }
+
+    matches
 }
 
 async fn request_guard(
@@ -230,9 +237,10 @@ async fn request_guard(
 }
 
 fn mapping_guard() -> crate::error::AppResult<std::sync::MutexGuard<'static, ()>> {
-    MAPPING_LOCK
-        .lock()
-        .map_err(|_| crate::error::AppError::Msg("mapping operation mutex was poisoned".into()))
+    MAPPING_LOCK.lock().map_err(|error| {
+        tracing::error!(%error, "mapping operation mutex was poisoned");
+        crate::error::AppError::Msg("mapping operation mutex was poisoned".into())
+    })
 }
 
 /// Ensure a value can safely occupy one field in the legacy CSV format.
@@ -245,12 +253,20 @@ fn validate_csv_field(name: &str, value: &str) -> crate::error::AppResult<()> {
         || value.contains(',')
         || value.chars().any(char::is_control)
     {
+        warn!(
+            field = %name,
+            value_len = value.len(),
+            contains_comma = value.contains(','),
+            has_control_chars = value.chars().any(char::is_control),
+            "rejecting invalid CSV field value"
+        );
         return Err(crate::error::AppError::Msg(format!(
             "{name} must be nonempty, at most 255 bytes, \
              and contain no commas or control characters"
         )));
     }
 
+    debug!(field = %name, value_len = value.len(), "CSV field validated");
     Ok(())
 }
 
@@ -269,6 +285,8 @@ fn atomic_mapping_write(destination: &str, contents: &[u8]) -> crate::error::App
     use std::os::unix::fs::PermissionsExt;
 
     let destination = Path::new(destination);
+    tracing::debug!(path = %destination.display(), bytes = contents.len(), "writing mapping file atomically");
+
     let parent = destination
         .parent()
         .ok_or_else(|| AppError::Msg("mapping file has no parent directory".into()))?;
@@ -284,8 +302,12 @@ fn atomic_mapping_write(destination: &str, contents: &[u8]) -> crate::error::App
 
     temporary
         .persist(destination)
-        .map_err(|error| AppError::Io(error.error))?;
+        .map_err(|error| {
+            tracing::error!(path = %destination.display(), error = %error, "mapping file persist failed");
+            AppError::Io(error.error)
+        })?;
 
+    tracing::info!(path = %destination.display(), bytes = contents.len(), "mapping file persisted");
     Ok(())
 }
 
@@ -293,20 +315,28 @@ fn atomic_mapping_write(destination: &str, contents: &[u8]) -> crate::error::App
 fn persist_usb_mappings(state: &AppState, mappings: &UsbMappings) -> crate::error::AppResult<()> {
     let other = state.gen5_map.blocking_read();
 
+    tracing::debug!(usb_count = mappings.len(), gen5_count = other.len(), "persisting USB mappings");
     crate::store::validate_snapshot(mappings, &other, &state.hardware)?;
 
     let contents = crate::store::encode_usb(mappings)?;
-    crate::store::atomic_replace(Path::new(USB_MAPPING_FILE), contents.as_bytes())
+    crate::store::atomic_replace(Path::new(USB_MAPPING_FILE), contents.as_bytes())?;
+
+    tracing::info!(usb_count = mappings.len(), path = %USB_MAPPING_FILE, "USB mapping state persisted");
+    Ok(())
 }
 
 /// Call only from blocking workers while holding MAPPING_LOCK.
 fn persist_gen5_mappings(state: &AppState, mappings: &Gen5Mappings) -> crate::error::AppResult<()> {
     let other = state.usb_map.blocking_read();
 
+    tracing::debug!(gen5_count = mappings.len(), usb_count = other.len(), "persisting Gen5 mappings");
     crate::store::validate_snapshot(&other, mappings, &state.hardware)?;
 
     let contents = crate::store::encode_gen5(mappings)?;
-    crate::store::atomic_replace(Path::new(GEN5_MAPPING_FILE), contents.as_bytes())
+    crate::store::atomic_replace(Path::new(GEN5_MAPPING_FILE), contents.as_bytes())?;
+
+    tracing::info!(gen5_count = mappings.len(), path = %GEN5_MAPPING_FILE, "Gen5 mapping state persisted");
+    Ok(())
 }
 
 /// Observe a boot after cycling the selected power source.
@@ -328,6 +358,8 @@ where
     F: FnMut(bool) -> crate::error::AppResult<()>,
 {
     use crate::error::AppError;
+
+    tracing::debug!(off_delay_ms = off_delay.as_millis(), "starting board power-cycle probe");
 
     let observation = (|| {
         set_power(false)?;
@@ -351,12 +383,24 @@ where
     })();
 
     match (observation, restart) {
-        (Ok(found), Ok(())) => Ok(found),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
-        (Err(probe), Err(reset)) => Err(AppError::Msg(format!(
-            "UART probe failed: {probe}; board restart also failed: {reset}"
-        ))),
+        (Ok(found), Ok(())) => {
+            tracing::info!(observed_mac = ?found, "board power-cycle probe completed successfully");
+            Ok(found)
+        }
+        (Err(error), Ok(())) => {
+            tracing::warn!(%error, "board probe failed after power cycle, but reset completed");
+            Err(error)
+        }
+        (Ok(_), Err(error)) => {
+            tracing::warn!(%error, "board probe succeeded but power reset failed");
+            Err(error)
+        }
+        (Err(probe), Err(reset)) => {
+            tracing::error!(probe = %probe, reset = %reset, "UART probe and board restart both failed");
+            Err(AppError::Msg(format!(
+                "UART probe failed: {probe}; board restart also failed: {reset}"
+            )))
+        }
     }
 }
 
@@ -368,16 +412,18 @@ where
 #[allow(dead_code)]
 fn is_relay_tty(tty: &str) -> bool {
     let Some(name) = Path::new(tty).file_name() else {
+        debug!(tty = %tty, "relay tty check skipped because path has no file name");
         return false;
     };
 
     let device_path = Path::new("/sys/class/tty").join(name).join("device");
 
-    let Ok(device_path) = fs::canonicalize(device_path) else {
+    let Ok(canonical_path) = fs::canonicalize(&device_path) else {
+        debug!(tty = %tty, path = %device_path.display(), "relay tty sysfs path not found");
         return false;
     };
 
-    device_path.ancestors().any(|ancestor| {
+    let matches = canonical_path.ancestors().any(|ancestor| {
         let vendor = fs::read_to_string(ancestor.join("idVendor"));
         let product = fs::read_to_string(ancestor.join("idProduct"));
 
@@ -387,7 +433,10 @@ fn is_relay_tty(tty: &str) -> bool {
                 if vendor.trim().eq_ignore_ascii_case("0403")
                     && product.trim().eq_ignore_ascii_case("6001")
         )
-    })
+    });
+
+    debug!(tty = %tty, is_relay = matches, "relay tty classification result");
+    matches
 }
 
 /// Discover a Gen3/Gen4 console using a specific relay channel.
@@ -508,6 +557,7 @@ fn resolve_gen5_mapping_sync(
 ) -> crate::error::AppResult<Option<(String, String)>> {
     use crate::error::AppError;
 
+    tracing::debug!(target_mac = %mac, "starting Gen5 mapping resolution");
     let mac = validated_mac(mac)?;
     let _operation = mapping_guard()?;
 
@@ -572,18 +622,22 @@ fn resolve_gen5_mapping_sync(
 }
 
 fn ok() -> Json<serde_json::Value> {
+    debug!("generic success response generated");
     Json(serde_json::json!({"OK": true}))
 }
 
 fn err_json(msg: &str, code: StatusCode) -> (StatusCode, Json<serde_json::Value>) {
+    debug!(status = %code, error = %msg, "error JSON response created");
     (code, Json(serde_json::json!({ "error": msg })))
 }
 
 fn error_response(message: impl AsRef<str>, status: StatusCode) -> Response {
+    let message = message.as_ref();
+    warn!(status = %status, error = %message, "API request failed and returned an error response");
     (
         status,
         Json(serde_json::json!({
-            "error": message.as_ref()
+            "error": message
         })),
     )
         .into_response()
@@ -618,7 +672,10 @@ pub fn router(state: Arc<AppState>) -> Router {
 }
 
 fn required<T>(value: Option<T>, field: &str) -> crate::error::AppResult<T> {
-    value.ok_or_else(|| crate::error::AppError::Msg(format!("{field} is required")))
+    value.ok_or_else(|| {
+        warn!(field = %field, "required request value missing");
+        crate::error::AppError::Msg(format!("{field} is required"))
+    })
 }
 
 async fn gen4_target(
@@ -1481,7 +1538,13 @@ async fn ipl_remove(
 ///
 /// Exact comparison avoids accepting a prefix of another device's MAC.
 fn validated_mac(value: &str) -> crate::error::AppResult<String> {
-    crate::store::checked_mac(value)
+    let result = crate::store::checked_mac(value);
+    if let Err(error) = &result {
+        warn!(mac = %value, %error, "MAC validation failed");
+    } else {
+        debug!(mac = %value, "MAC validation succeeded");
+    }
+    result
 }
 
 /// Resolve symlinks and restrict serial access to actual USB/ACM character
@@ -1492,7 +1555,14 @@ fn validated_mac(value: &str) -> crate::error::AppResult<String> {
 fn checked_tty(value: &str) -> crate::error::AppResult<String> {
     use std::os::unix::fs::FileTypeExt;
 
-    let path = fs::canonicalize(value)?;
+    let path = match fs::canonicalize(value) {
+        Ok(path) => path,
+        Err(error) => {
+            warn!(tty = %value, %error, "TTY canonicalization failed");
+            return Err(error.into());
+        }
+    };
+
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -1508,14 +1578,19 @@ fn checked_tty(value: &str) -> crate::error::AppResult<String> {
         || !recognized_name
         || !fs::metadata(&path)?.file_type().is_char_device()
     {
+        warn!(tty = %value, canonical = %path.display(), recognized_name, "TTY validation rejected");
         return Err(crate::error::AppError::Msg(
             "expected a USB or ACM serial character device".into(),
         ));
     }
 
-    path.to_str()
+    let canonical = path
+        .to_str()
         .map(str::to_owned)
-        .ok_or_else(|| crate::error::AppError::Msg("non-UTF-8 TTY path".into()))
+        .ok_or_else(|| crate::error::AppError::Msg("non-UTF-8 TTY path".into()))?;
+
+    debug!(tty = %value, canonical = %canonical, "TTY validation succeeded");
+    Ok(canonical)
 }
 
 /// Preserve the legacy Gen4 RTOS mapping convention.
@@ -1793,17 +1868,23 @@ async fn notify_relay_config(
         state.cfg.server_ip, state.cfg.http_port,
     );
 
-    state
-        .client
-        .post(url)
-        .json(&serde_json::json!({
-            "mac": mac,
-            "status": if success { "success" } else { "failure" },
-        }))
-        .send()
-        .await?
-        .error_for_status()?;
+    let payload = serde_json::json!({
+        "mac": mac,
+        "status": if success { "success" } else { "failure" },
+    });
 
+    tracing::info!(%url, mac = %mac, success, "sending relay-config confirmation to backend");
+
+    let response = state.client.post(url).json(&payload).send().await?;
+    let status = response.status();
+
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_else(|_| "<unreadable>".to_owned());
+        tracing::warn!(%mac, %status, body = %body, "relay-config confirmation rejected by backend");
+        return Ok(());
+    }
+
+    tracing::debug!(%mac, %status, "relay-config confirmation accepted by backend");
     Ok(())
 }
 
@@ -1833,14 +1914,17 @@ async fn notify_gen5_mapping(
         state.cfg.server_ip, state.cfg.http_port,
     );
 
-    state
-        .client
-        .post(url)
-        .json(&payload)
-        .send()
-        .await?
-        .error_for_status()?;
+    tracing::info!(%url, mac = %mac, mapping_present = mapping.is_some(), "sending Gen5 mapping notification to backend");
+    let response = state.client.post(url).json(&payload).send().await?;
+    let status = response.status();
 
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_else(|_| "<unreadable>".to_owned());
+        tracing::warn!(%mac, %status, body = %body, "Gen5 mapping notification rejected by backend");
+        return Ok(());
+    }
+
+    tracing::debug!(%mac, %status, "Gen5 mapping notification accepted by backend");
     Ok(())
 }
 
@@ -1976,10 +2060,13 @@ fn extract_uboot_mac(response: &[u8]) -> crate::error::AppResult<Option<String>>
 
 fn parse_power_state(value: &str) -> crate::error::AppResult<bool> {
     if value.eq_ignore_ascii_case("on") {
+        debug!(state = %value, parsed = true, "power state parsed as ON");
         Ok(true)
     } else if value.eq_ignore_ascii_case("off") {
+        debug!(state = %value, parsed = false, "power state parsed as OFF");
         Ok(false)
     } else {
+        warn!(state = %value, "invalid power state received; expected on/off");
         Err(crate::error::AppError::Msg(
             "state must be 'on' or 'off'".into(),
         ))
@@ -1995,6 +2082,7 @@ fn parse_power_state(value: &str) -> crate::error::AppResult<bool> {
 /// USB topology changes.
 async fn mapped_power_tty(state: &AppState, supplied: &str) -> crate::error::AppResult<String> {
     let supplied = checked_tty(supplied)?;
+    tracing::debug!(supplied_tty = %supplied, "validating supplied Gen5 power TTY");
     state.hardware.power_allowed(&supplied)?;
 
     let entries: Vec<String> = state
@@ -2012,11 +2100,13 @@ async fn mapped_power_tty(state: &AppState, supplied: &str) -> crate::error::App
     });
 
     if !permitted {
+        warn!(supplied_tty = %supplied, mapped_count = entries.len(), "power device is not present in a stored Gen5 mapping");
         return Err(crate::error::AppError::Msg(
             "power device is not present in a stored Gen5 mapping".into(),
         ));
     }
 
+    info!(supplied_tty = %supplied, "Gen5 power TTY authorized and mapped");
     Ok(supplied)
 }
 

@@ -65,6 +65,7 @@ fn open_regular(path: &Path) -> AppResult<Option<File>> {
 
 pub fn read_optional_text(path: &Path, limit: usize) -> AppResult<Option<String>> {
     let Some(file) = open_regular(path)? else {
+        tracing::debug!(path = %path.display(), "state file absent; treat as empty/default mapping state");
         return Ok(None);
     };
 
@@ -82,6 +83,7 @@ pub fn read_optional_text(path: &Path, limit: usize) -> AppResult<Option<String>
     let text = String::from_utf8(bytes)
         .map_err(|_| invalid(format!("{} is not valid UTF-8", path.display())))?;
 
+    tracing::debug!(path = %path.display(), bytes = text.len(), "state file read successfully");
     Ok(Some(text))
 }
 
@@ -184,6 +186,7 @@ pub fn validate_uid(value: &str) -> AppResult<()> {
 
 pub fn load_uid(path: &Path) -> AppResult<Option<String>> {
     let Some(text) = read_optional_text(path, MAX_UID_BYTES + 2)? else {
+        tracing::debug!(path = %path.display(), "UID not present; controller not yet confirmed");
         return Ok(None);
     };
 
@@ -196,6 +199,7 @@ pub fn load_uid(path: &Path) -> AppResult<Option<String>> {
     validate_uid(uid)
         .map_err(|error| invalid(format!("invalid UID file {}: {error}", path.display())))?;
 
+    tracing::info!(path = %path.display(), uid = %uid, "loaded persisted controller UID");
     Ok(Some(uid.to_owned()))
 }
 
@@ -316,6 +320,12 @@ pub fn validate_snapshot(
     gen5: &Gen5Mappings,
     policy: &HardwarePolicy,
 ) -> AppResult<()> {
+    tracing::debug!(
+        usb_count = usb.len(),
+        gen5_count = gen5.len(),
+        "validating persisted USB and Gen5 mappings against hardware policy"
+    );
+
     // Reparse the serialized form to enforce the same rules for in-memory
     // writes as for startup reads.
     let parsed_usb = parse_usb(&encode_usb(usb)?)?;
@@ -329,35 +339,55 @@ pub fn validate_snapshot(
             .boards
             .iter()
             .find(|board| board.mac == *mac && matches!(board.gen, 3 | 4))
-            .ok_or_else(|| invalid("persisted USB mapping references an unapproved board"))?;
+            .ok_or_else(|| {
+                tracing::warn!(mac = %mac, tty = %tty, "persisted USB mapping references an unapproved board");
+                invalid("persisted USB mapping references an unapproved board")
+            })?;
 
         let relay = board
             .relay
             .as_ref()
-            .ok_or_else(|| invalid("approved board lacks a relay binding"))?;
+            .ok_or_else(|| {
+                tracing::warn!(mac = %mac, "approved board is missing a relay binding");
+                invalid("approved board lacks a relay binding")
+            })?;
 
         if relay.serial != *serial || relay.channel != *channel {
+            tracing::warn!(
+                mac = %mac,
+                stored_serial = %serial,
+                stored_channel = channel,
+                approved_serial = %relay.serial,
+                approved_channel = relay.channel,
+                "persisted relay/channel differs from approved wiring"
+            );
             return Err(invalid(
                 "persisted relay/channel differs from approved wiring",
             ));
         }
 
         if !used_devices.insert(tty.clone()) || !used_macs.insert(mac.clone()) {
+            tracing::warn!(mac = %mac, tty = %tty, "conflicting persisted USB mapping detected");
             return Err(invalid("conflicting persisted USB mapping"));
         }
     }
 
     for (mac, entry) in &parsed_gen5 {
-        policy.board(mac, 5)?;
+        if let Err(error) = policy.board(mac, 5) {
+            tracing::warn!(mac = %mac, error = %error, "Gen5 mapping references an unapproved board");
+            return Err(error);
+        }
 
         if !used_macs.insert(mac.clone())
             || !used_devices.insert(entry.uart.clone())
             || !used_devices.insert(entry.power.clone())
         {
+            tracing::warn!(mac = %mac, uart = %entry.uart, power = %entry.power, "Gen5 mapping shares a board or device pathname");
             return Err(invalid("mapping files share a board or device pathname"));
         }
     }
 
+    tracing::info!(usb_count = parsed_usb.len(), gen5_count = parsed_gen5.len(), "persisted mapping snapshot validated");
     Ok(())
 }
 
@@ -369,13 +399,29 @@ pub fn load_mappings(
     let usb_text = read_optional_text(usb_path, MAX_STATE_BYTES)?.unwrap_or_default();
     let gen5_text = read_optional_text(gen5_path, MAX_STATE_BYTES)?.unwrap_or_default();
 
+    tracing::debug!(
+        usb_path = %usb_path.display(),
+        gen5_path = %gen5_path.display(),
+        usb_bytes = usb_text.len(),
+        gen5_bytes = gen5_text.len(),
+        "loading persisted mappings and validating them"
+    );
+
     let usb = parse_usb(&usb_text)
-        .map_err(|error| invalid(format!("invalid {}: {error}", usb_path.display())))?;
+        .map_err(|error| {
+            tracing::error!(path = %usb_path.display(), error = %error, "USB mapping file is invalid");
+            invalid(format!("invalid {}: {error}", usb_path.display()))
+        })?;
 
     let gen5 = parse_gen5(&gen5_text)
-        .map_err(|error| invalid(format!("invalid {}: {error}", gen5_path.display())))?;
+        .map_err(|error| {
+            tracing::error!(path = %gen5_path.display(), error = %error, "Gen5 mapping file is invalid");
+            invalid(format!("invalid {}: {error}", gen5_path.display()))
+        })?;
 
     validate_snapshot(&usb, &gen5, policy)?;
+
+    tracing::info!(usb_mappings = usb.len(), gen5_mappings = gen5.len(), "persisted mappings loaded and verified");
     Ok((usb, gen5))
 }
 
@@ -424,8 +470,11 @@ pub fn encode_gen5(mappings: &Gen5Mappings) -> AppResult<String> {
 /// the matching in-memory value. Crash durability is uncertain in that case.
 pub fn atomic_replace(path: &Path, contents: &[u8]) -> AppResult<()> {
     if contents.len() > MAX_STATE_BYTES {
+        tracing::error!(path = %path.display(), size = contents.len(), "state write exceeds limit");
         return Err(invalid("state write exceeds 1 MiB"));
     }
+
+    tracing::debug!(path = %path.display(), bytes = contents.len(), "writing state atomically");
 
     let parent = path
         .parent()
@@ -434,6 +483,7 @@ pub fn atomic_replace(path: &Path, contents: &[u8]) -> AppResult<()> {
     // Reject a pre-existing symlink or special file.
     match fs::symlink_metadata(path) {
         Ok(metadata) if !metadata.is_file() => {
+            tracing::warn!(path = %path.display(), "refusing to replace non-regular state file");
             return Err(invalid(format!(
                 "{} must be a regular file",
                 path.display()
@@ -465,10 +515,13 @@ pub fn atomic_replace(path: &Path, contents: &[u8]) -> AppResult<()> {
         );
     }
 
+    tracing::info!(path = %path.display(), bytes = contents.len(), "state file atomically replaced");
     Ok(())
 }
 
 pub fn remove_committed(path: &Path) -> AppResult<()> {
+    tracing::debug!(path = %path.display(), "removing persisted state file");
+
     let parent = path
         .parent()
         .ok_or_else(|| invalid("state pathname has no parent directory"))?;
@@ -476,10 +529,12 @@ pub fn remove_committed(path: &Path) -> AppResult<()> {
 
     match fs::symlink_metadata(path) {
         Ok(metadata) if !metadata.is_file() => {
+            tracing::warn!(path = %path.display(), "refusing to remove non-regular state file");
             return Err(invalid("refusing to remove non-regular state file"));
         }
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!(path = %path.display(), "state file was already absent; no-op removal");
             return Ok(());
         }
         Err(error) => return Err(error.into()),
@@ -499,6 +554,7 @@ pub fn remove_committed(path: &Path) -> AppResult<()> {
         );
     }
 
+    tracing::info!(path = %path.display(), "persisted state file removed");
     Ok(())
 }
 

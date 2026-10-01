@@ -134,24 +134,38 @@ impl AppState {
         store::validate_uid(uid)?;
         let mut controller = self.controller.write().await;
 
+        tracing::info!(uid = %uid, path = %UID_FILE, "persisting controller UID to state store");
+
         // No .await between commit and publication.
         store::atomic_replace(Path::new(UID_FILE), uid.as_bytes())?;
         controller.uid = Some(uid.to_owned());
 
+        tracing::debug!(uid = %uid, "controller UID written and published in memory");
         Ok(())
     }
 
     pub async fn clear_uid(&self) -> AppResult<()> {
         let mut controller = self.controller.write().await;
 
+        tracing::warn!(path = %UID_FILE, "clearing persisted controller UID");
         store::remove_committed(Path::new(UID_FILE))?;
         controller.uid = None;
 
+        tracing::info!(path = %UID_FILE, "controller UID removed from persisted state and memory");
         Ok(())
     }
 
     pub async fn registration_payload(&self, relays: Vec<RelayInventory>) -> RegistrationPayload {
         let controller = self.controller.read().await;
+        let relay_count = relays.len();
+
+        tracing::debug!(
+            mac = %controller.board_mac,
+            ip = %controller.board_ip,
+            uid = ?controller.uid,
+            relay_count,
+            "building backend registration payload"
+        );
 
         RegistrationPayload {
             mac_address: controller.board_mac.clone(),
