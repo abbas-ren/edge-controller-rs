@@ -27,6 +27,7 @@ use tracing::{debug, info, warn};
 const USAGE: &str = "\
 Usage:
   dev-controller-rs [CONFIG]
+  dev-controller-rs [--enable-gen3|--enable-gen4|--enable-gen5|--enable-rtos] [CONFIG]
   dev-controller-rs --check [CONFIG]
   dev-controller-rs --log-level LEVEL [CONFIG]
   dev-controller-rs --verbose [CONFIG]
@@ -38,9 +39,33 @@ CONFIG defaults to /etc/config/login.cfg.
 and persisted state without accessing hardware or contacting the backend.
 It does not modify or repair files.
 
+--enable-gen3 enables Gen3 relay-only behavior.
+--enable-gen4 enables Gen4 relay/flash behavior.
+--enable-gen5 enables Gen5 power/UART mapping and IPL behavior.
+--enable-rtos enables RTOS capture endpoints.
+
 --log-level accepts trace|debug|info|warn|error.
 --verbose sets debug logging for troubleshooting.
 ";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FeatureFlags {
+    pub gen3: bool,
+    pub gen4: bool,
+    pub gen5: bool,
+    pub rtos: bool,
+}
+
+impl FeatureFlags {
+    pub fn generation_enabled(&self, generation: u8) -> bool {
+        match generation {
+            3 => self.gen3,
+            4 => self.gen4,
+            5 => self.gen5,
+            _ => false,
+        }
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum Cli {
@@ -49,6 +74,7 @@ enum Cli {
         config_path: String,
         check_only: bool,
         log_level: Option<String>,
+        features: FeatureFlags,
     },
 }
 
@@ -61,6 +87,7 @@ impl Cli {
         let mut check_only = false;
         let mut help = false;
         let mut log_level = None;
+        let mut features = FeatureFlags::default();
         let mut arguments = arguments.into_iter().peekable();
 
         while let Some(argument) = arguments.next() {
@@ -81,6 +108,34 @@ impl Cli {
                         return Err(anyhow!("--check supplied more than once"));
                     }
                     check_only = true;
+                }
+
+                "--enable-gen3" => {
+                    if features.gen3 {
+                        return Err(anyhow!("--enable-gen3 supplied more than once"));
+                    }
+                    features.gen3 = true;
+                }
+
+                "--enable-gen4" => {
+                    if features.gen4 {
+                        return Err(anyhow!("--enable-gen4 supplied more than once"));
+                    }
+                    features.gen4 = true;
+                }
+
+                "--enable-gen5" => {
+                    if features.gen5 {
+                        return Err(anyhow!("--enable-gen5 supplied more than once"));
+                    }
+                    features.gen5 = true;
+                }
+
+                "--enable-rtos" => {
+                    if features.rtos {
+                        return Err(anyhow!("--enable-rtos supplied more than once"));
+                    }
+                    features.rtos = true;
                 }
 
                 "-v" | "--verbose" => {
@@ -130,7 +185,7 @@ impl Cli {
         }
 
         if help {
-            if check_only || config_path.is_some() || log_level.is_some() {
+            if check_only || config_path.is_some() || log_level.is_some() || features != FeatureFlags::default() {
                 return Err(anyhow!("--help must be used on its own"));
             }
 
@@ -141,6 +196,7 @@ impl Cli {
             config_path: config_path.unwrap_or_else(|| config::LOGIN_PATH.to_owned()),
             check_only,
             log_level,
+            features,
         })
     }
 }
@@ -352,17 +408,19 @@ async fn main() -> Result<()> {
         .context("installing SIGINT handler")?;
 
     // Optional first argument overrides the legacy configuration pathname.
-    let (config_path, check_only, log_level) = match Cli::parse(std::env::args_os().skip(1))? {
-        Cli::Help => {
-            print!("{USAGE}");
-            return Ok(());
-        }
-        Cli::Start {
-            config_path,
-            check_only,
-            log_level,
-        } => (config_path, check_only, log_level),
-    };
+    let (config_path, check_only, log_level, features) =
+        match Cli::parse(std::env::args_os().skip(1))? {
+            Cli::Help => {
+                print!("{USAGE}");
+                return Ok(());
+            }
+            Cli::Start {
+                config_path,
+                check_only,
+                log_level,
+                features,
+            } => (config_path, check_only, log_level, features),
+        };
 
     logging::init_logging(log_level.as_deref());
 
@@ -437,7 +495,7 @@ async fn main() -> Result<()> {
         "controller identity loaded"
     );
 
-    let state = AppState::new(cfg, mac, ip)
+    let state = AppState::new(cfg, mac, ip, features)
         .await
         .context("initializing controller state")?;
 
@@ -560,7 +618,7 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod cli_tests {
-    use super::{Cli, USAGE};
+    use super::{Cli, FeatureFlags, USAGE};
     use std::ffi::OsString;
 
     fn arguments(values: &[&str]) -> Vec<OsString> {
@@ -575,6 +633,30 @@ mod cli_tests {
                 config_path: crate::config::LOGIN_PATH.into(),
                 check_only: false,
                 log_level: None,
+                features: FeatureFlags {
+                    gen3: false,
+                    gen4: false,
+                    gen5: false,
+                    rtos: false,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn feature_flags_are_parsed_explicitly() {
+        assert_eq!(
+            Cli::parse(arguments(&["--enable-gen4", "--enable-rtos"])).unwrap(),
+            Cli::Start {
+                config_path: crate::config::LOGIN_PATH.into(),
+                check_only: false,
+                log_level: None,
+                features: FeatureFlags {
+                    gen3: false,
+                    gen4: true,
+                    gen5: false,
+                    rtos: true,
+                },
             }
         );
     }
@@ -587,6 +669,12 @@ mod cli_tests {
                 config_path: "/etc/dev-controller/custom.cfg".into(),
                 check_only: false,
                 log_level: None,
+                features: FeatureFlags {
+                    gen3: false,
+                    gen4: false,
+                    gen5: false,
+                    rtos: false,
+                },
             }
         );
     }
@@ -599,6 +687,12 @@ mod cli_tests {
                 config_path: crate::config::LOGIN_PATH.into(),
                 check_only: true,
                 log_level: None,
+                features: FeatureFlags {
+                    gen3: false,
+                    gen4: false,
+                    gen5: false,
+                    rtos: false,
+                },
             }
         );
 
@@ -612,6 +706,12 @@ mod cli_tests {
                     config_path: "/tmp/controller.cfg".into(),
                     check_only: true,
                     log_level: None,
+                    features: FeatureFlags {
+                        gen3: false,
+                        gen4: false,
+                        gen5: false,
+                        rtos: false,
+                    },
                 }
             );
         }
@@ -629,6 +729,12 @@ mod cli_tests {
                 config_path: crate::config::LOGIN_PATH.into(),
                 check_only: false,
                 log_level: Some("debug".to_owned()),
+                features: FeatureFlags {
+                    gen3: false,
+                    gen4: false,
+                    gen5: false,
+                    rtos: false,
+                },
             }
         );
 

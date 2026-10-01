@@ -6,6 +6,7 @@ use crate::{
     models::{RegistrationPayload, RelayInventory},
     relay::RelayController,
     store::{self, Gen5Mappings, UsbMappings},
+    FeatureFlags,
 };
 
 use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
@@ -39,10 +40,16 @@ pub struct AppState {
     pub jobs: Jobs,
     pub api_token: Option<String>,
     pub hardware: HardwarePolicy,
+    pub features: FeatureFlags,
 }
 
 impl AppState {
-    pub async fn new(cfg: AppConfig, board_mac: String, board_ip: String) -> AppResult<Arc<Self>> {
+    pub async fn new(
+        cfg: AppConfig,
+        board_mac: String,
+        board_ip: String,
+        features: FeatureFlags,
+    ) -> AppResult<Arc<Self>> {
         cfg.validate()?;
         store::checked_mac(&board_mac)?;
 
@@ -69,10 +76,11 @@ impl AppState {
             ));
         }
 
+        let features_for_state = features.clone();
         let (hardware, usb_map, gen5_map, uid) = tokio::task::spawn_blocking(move || {
             tracing::info!(hardware_path = %hardware_path, "loading hardware policy and persisted state");
 
-            let hardware = HardwarePolicy::load(&hardware_path)?;
+            let hardware = HardwarePolicy::load_with_features(&hardware_path, &features_for_state)?;
             tracing::info!(
                 board_count = hardware.boards.len(),
                 hardware_path = %hardware_path,
@@ -131,6 +139,7 @@ impl AppState {
             jobs: Jobs::default(),
             api_token,
             hardware,
+            features,
         });
 
         let controller_uid = state.controller.read().await.uid.clone();

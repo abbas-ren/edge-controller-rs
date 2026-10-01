@@ -1,12 +1,12 @@
 {
   "boards": [
     {
-      "mac": "aa:bb:cc:dd:ee:01",
+      "mac": "2e:09:0a:06:da:df",
       "gen": 4,
       "uart": {
-        "vid": 1027,
-        "pid": 24592,
-        "serial": "REPLACE_GEN4_UART_SERIAL",
+        "vid": 4292,
+        "pid": 60000,
+        "serial": "0001",
         "interface": 0
       },
       "rtos": {
@@ -16,33 +16,31 @@
         "interface": 1
       },
       "relay": {
-        "serial": "REPLACE_RELAY_SERIAL",
-        "channel": 0
+        "serial": "AB0OFAFX",
+        "channel": 1
       },
-      "gpios": [17, 27]
+      "gpios": [4, 5]
     },
     {
-      "mac": "aa:bb:cc:dd:ee:02",
-      "gen": 5,
+      "mac": "2e:09:0a:06:d9:8e",
+      "gen": 4,
       "uart": {
-        "vid": 1027,
-        "pid": 24592,
-        "serial": "REPLACE_GEN5_UART_SERIAL",
-        "interface": 0
-      },
-      "power": {
         "vid": 4292,
         "pid": 60000,
-        "serial": "REPLACE_POWER_SERIAL",
-        "interface": 0
+        "serial": "0001",
+        "interface": 1
       },
       "rtos": {
         "vid": 1027,
         "pid": 24592,
-        "serial": "REPLACE_GEN5_UART_SERIAL",
+        "serial": "REPLACE_GEN4_UART_SERIAL",
         "interface": 1
-      }
+      },
+      "relay": {
+        "serial": "AB0OFAFX",
+        "channel": 0
+      },
+      "gpios": [2, 3]
     }
   ]
 }
-

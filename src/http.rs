@@ -151,6 +151,28 @@ async fn request_guard(
         }
     }
 
+    let is_gen3_or_gen4 = matches!(path.as_str(), "/relay" | "/relay/status" | "/relay/config" | "/relay/delete" | "/devCon/delete" | "/mapping/entry" | "/reboot-device" | "/ipl" | "/ipl-mode" | "/ipl-mode/default" | "/ipl/remove")
+        && !(state.features.gen3 || state.features.gen4);
+    let is_gen5 = matches!(path.as_str(), "/gen5/tty_entry" | "/gen5/power" | "/mapping/entry" | "/reboot-device" | "/ipl" | "/ipl-mode" | "/ipl-mode/default" | "/ipl/remove") && !state.features.gen5;
+    if (path.as_str() == "/rtos/start" || path.as_str() == "/rtos/end") && !state.features.rtos {
+        return error_response(
+            "RTOS capture is disabled; start the service with --enable-rtos",
+            StatusCode::NOT_IMPLEMENTED,
+        );
+    }
+    if is_gen3_or_gen4 {
+        return error_response(
+            "Gen3/Gen4 functionality is disabled; start the service with --enable-gen3 or --enable-gen4",
+            StatusCode::NOT_IMPLEMENTED,
+        );
+    }
+    if is_gen5 {
+        return error_response(
+            "Gen5 functionality is disabled; start the service with --enable-gen5",
+            StatusCode::NOT_IMPLEMENTED,
+        );
+    }
+
     if state.jobs.is_closing() {
         return error_response(
             "controller is shutting down",
@@ -686,23 +708,41 @@ macro_rules! log_handler_request {
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
-    Router::new()
-        .route("/confirmation", post(confirmation))
-        .route("/relay", post(relay))
-        .route("/relay/status", post(relay_status))
-        .route("/relay/config", post(relay_config))
-        .route("/devCon/delete", post(devcon_delete))
-        .route("/relay/delete", post(relay_delete))
-        .route("/ipl", post(ipl_run))
-        .route("/ipl-mode", post(ipl_mode))
-        .route("/ipl-mode/default", post(ipl_mode_default))
-        .route("/gen5/tty_entry", post(gen5_tty_entry))
-        .route("/gen5/power", post(gen5_power))
-        .route("/mapping/entry", post(mapping_entry))
-        .route("/reboot-device", post(reboot_device))
-        .route("/ipl/remove", post(ipl_remove))
-        .route("/rtos/start", post(rtos_start))
-        .route("/rtos/end", post(rtos_end))
+    let mut router = Router::new()
+        .route("/confirmation", post(confirmation));
+
+    if state.features.gen3 || state.features.gen4 {
+        router = router
+            .route("/relay", post(relay))
+            .route("/relay/status", post(relay_status))
+            .route("/relay/config", post(relay_config))
+            .route("/relay/delete", post(relay_delete))
+            .route("/devCon/delete", post(devcon_delete))
+            .route("/mapping/entry", post(mapping_entry))
+            .route("/reboot-device", post(reboot_device));
+    }
+
+    if state.features.gen4 || state.features.gen5 {
+        router = router
+            .route("/ipl", post(ipl_run))
+            .route("/ipl-mode", post(ipl_mode))
+            .route("/ipl-mode/default", post(ipl_mode_default))
+            .route("/ipl/remove", post(ipl_remove));
+    }
+
+    if state.features.gen5 {
+        router = router
+            .route("/gen5/tty_entry", post(gen5_tty_entry))
+            .route("/gen5/power", post(gen5_power));
+    }
+
+    if state.features.rtos {
+        router = router
+            .route("/rtos/start", post(rtos_start))
+            .route("/rtos/end", post(rtos_end));
+    }
+
+    router
         .layer(middleware::from_fn_with_state(state.clone(), request_guard))
         .with_state(state)
 }

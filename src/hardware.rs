@@ -6,6 +6,7 @@
 use crate::{
     error::{AppError, AppResult},
     usb::{self, UsbIdentity},
+    FeatureFlags,
 };
 
 use serde::Deserialize;
@@ -38,16 +39,25 @@ pub struct HardwarePolicy {
 
 impl HardwarePolicy {
     pub fn load(path: &str) -> AppResult<Self> {
+        Self::load_with_features(path, &FeatureFlags::default())
+    }
+
+    pub fn load_with_features(path: &str, features: &FeatureFlags) -> AppResult<Self> {
         let text = crate::store::read_required_text(std::path::Path::new(path), 64 * 1024)?;
 
         let mut policy: Self = serde_json::from_str(&text)
             .map_err(|error| AppError::Msg(format!("invalid hardware policy {path}: {error}")))?;
 
-        policy.validate()?;
+        policy.validate_with_features(features)?;
         Ok(policy)
     }
 
+    #[allow(dead_code)]
     fn validate(&mut self) -> AppResult<()> {
+        self.validate_with_features(&FeatureFlags::default())
+    }
+
+    fn validate_with_features(&mut self, features: &FeatureFlags) -> AppResult<()> {
         let mut macs = HashSet::new();
         let mut identities = HashSet::new();
         let mut relay_channels = HashSet::new();
@@ -71,10 +81,23 @@ impl HardwarePolicy {
                 return Err(AppError::Msg("invalid board generation".into()));
             }
 
-            for identity in [Some(&board.uart), board.power.as_ref(), board.rtos.as_ref()]
+            let identities_for_board: Vec<&UsbIdentity> = if features.rtos {
+                [
+                    Some(&board.uart),
+                    board.power.as_ref(),
+                    board.rtos.as_ref(),
+                ]
                 .into_iter()
                 .flatten()
-            {
+                .collect()
+            } else {
+                [Some(&board.uart), board.power.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .collect()
+            };
+
+            for identity in identities_for_board {
                 tracing::debug!(
                     mac = %board.mac,
                     generation = board.gen,
@@ -107,6 +130,34 @@ impl HardwarePolicy {
                         "one USB interface is assigned to multiple hardware roles".into(),
                     ));
                 }
+            }
+
+            match board.gen {
+                3 if !features.gen3 => {
+                    tracing::info!(
+                        mac = %board.mac,
+                        generation = board.gen,
+                        "Gen3 functionality disabled by feature flag; skipping Gen3-specific validation"
+                    );
+                    continue;
+                }
+                4 if !features.gen4 => {
+                    tracing::info!(
+                        mac = %board.mac,
+                        generation = board.gen,
+                        "Gen4 functionality disabled by feature flag; skipping Gen4-specific validation"
+                    );
+                    continue;
+                }
+                5 if !features.gen5 => {
+                    tracing::info!(
+                        mac = %board.mac,
+                        generation = board.gen,
+                        "Gen5 functionality disabled by feature flag; skipping Gen5-specific validation"
+                    );
+                    continue;
+                }
+                _ => {}
             }
 
             match board.gen {
@@ -262,17 +313,29 @@ mod tests {
     }
 
     #[test]
-    fn shared_interface_roles_are_rejected() {
+    fn shared_interface_roles_are_rejected_when_rtos_is_enabled() {
         let mut policy = policy();
         policy.boards[0].rtos = Some(policy.boards[0].uart.clone());
-        assert!(policy.validate().is_err());
+        let flags = FeatureFlags {
+            gen3: false,
+            gen4: false,
+            gen5: true,
+            rtos: true,
+        };
+        assert!(policy.validate_with_features(&flags).is_err());
     }
 
     #[test]
-    fn unexpected_gen5_interface_is_rejected() {
+    fn unexpected_gen5_interface_is_rejected_when_gen5_is_enabled() {
         let mut policy = policy();
         policy.boards[0].uart.interface = 1;
-        assert!(policy.validate().is_err());
+        let flags = FeatureFlags {
+            gen3: false,
+            gen4: false,
+            gen5: true,
+            rtos: false,
+        };
+        assert!(policy.validate_with_features(&flags).is_err());
     }
 
     #[test]
