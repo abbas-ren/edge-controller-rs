@@ -1,4 +1,4 @@
-//! Gen4 FlashWriter protocol and a Gen5 external-script adapter.
+//! Gen3/Gen4 FlashWriter protocol and a Gen5 external-script adapter.
 //!
 //! Hardware sequencing runs in blocking workers. Callers must retain an
 //! exclusive hardware-operation lease until these functions finish.
@@ -6,6 +6,7 @@
 use crate::{
     error::{AppError, AppResult},
     gpio::GpioController,
+    observability::metrics::global_metrics,
     state::AppState,
     uart::Console,
 };
@@ -27,6 +28,10 @@ const LOG_ROOT: &str = "/var/lib/dev-controller/ipl";
 const FLASHWRITER: &str = "ICUMX_Flash_writer_SCIF_DUMMY_CERT_EB203000_V4H.mot";
 
 const MAX_IMAGE_BYTES: u64 = 128 * 1024 * 1024;
+
+pub fn supports_relay_flash(generation: u8) -> bool {
+    matches!(generation, 3 | 4)
+}
 
 struct Image {
     name: &'static str,
@@ -87,7 +92,8 @@ const IMAGES: [Image; 8] = [
 ];
 
 #[derive(Clone)]
-pub struct Gen4Target {
+pub struct FlashWriterTarget {
+    pub generation: u8,
     pub tty: String,
     pub mac: String,
     pub serial: String,
@@ -140,7 +146,7 @@ fn image_file(package: &Path, name: &str) -> AppResult<PathBuf> {
     Ok(path)
 }
 
-pub fn preflight_gen4(package: &Path) -> AppResult<()> {
+pub fn preflight_flashwriter(package: &Path) -> AppResult<()> {
     image_file(package, FLASHWRITER)?;
 
     for image in &IMAGES {
@@ -183,7 +189,7 @@ fn seconds(value: u64) -> Duration {
 /// Change boot straps while power is off.
 ///
 /// This deliberately leaves the GPIO line request owned by the service.
-fn set_boot_mode(state: &AppState, target: &Gen4Target, download: bool) -> AppResult<()> {
+fn set_boot_mode(state: &AppState, target: &FlashWriterTarget, download: bool) -> AppResult<()> {
     state
         .relay
         .set_channel(&target.serial, target.channel, false)?;
@@ -200,7 +206,7 @@ fn set_boot_mode(state: &AppState, target: &Gen4Target, download: bool) -> AppRe
 }
 
 /// Enter SCIF download mode, opening UART before the boot begins.
-fn download_console(state: &AppState, target: &Gen4Target) -> AppResult<Console> {
+fn download_console(state: &AppState, target: &FlashWriterTarget) -> AppResult<Console> {
     let mut console = Console::open(&target.tty, 921_600)?;
     console.clear_input()?;
 
@@ -226,7 +232,7 @@ fn combine(operation: AppResult<()>, cleanup: AppResult<()>) -> AppResult<()> {
 /// On download-mode failure, attempt to restore normal boot. Unlike the
 /// legacy default-mode handler, normal boot does not wait for a download
 /// prompt that should not appear.
-pub fn mode_sync(state: &AppState, target: &Gen4Target, download: bool) -> AppResult<()> {
+pub fn mode_sync(state: &AppState, target: &FlashWriterTarget, download: bool) -> AppResult<()> {
     if !download {
         return set_boot_mode(state, target, false);
     }
@@ -311,11 +317,15 @@ fn log_file(generation: u8, mac: &str) -> AppResult<(PathBuf, File)> {
     Ok((path, file))
 }
 
-fn flash_gen4_sync(state: &AppState, target: &Gen4Target, package: &Path) -> AppResult<()> {
-    preflight_gen4(package)?;
-    let (_, mut log) = log_file(4, &target.mac)?;
+fn flashwriter_sync(state: &AppState, target: &FlashWriterTarget, package: &Path) -> AppResult<()> {
+    preflight_flashwriter(package)?;
+    let (_, mut log) = log_file(target.generation, &target.mac)?;
 
-    writeln!(log, "Starting Gen4 IPL for {}", target.mac)?;
+    writeln!(
+        log,
+        "Starting Gen{} IPL for {}",
+        target.generation, target.mac
+    )?;
 
     let operation = (|| {
         let mut console = download_console(state, target)?;
@@ -347,12 +357,16 @@ fn flash_gen4_sync(state: &AppState, target: &Gen4Target, package: &Path) -> App
     result
 }
 
-async fn notify(state: &AppState, generation: u8, success: bool) {
-    let endpoint = if generation == 4 {
+fn completion_endpoint(generation: u8) -> &'static str {
+    if supports_relay_flash(generation) {
         "flash-confirm-gen4"
     } else {
         "flash-confirm"
-    };
+    }
+}
+
+async fn notify(state: &AppState, generation: u8, success: bool) {
+    let endpoint = completion_endpoint(generation);
 
     let status = if success { "success" } else { "failure" };
 
@@ -376,19 +390,32 @@ async fn notify(state: &AppState, generation: u8, success: bool) {
     }
 }
 
-pub async fn run_gen4(state: Arc<AppState>, target: Gen4Target, package: PathBuf) -> AppResult<()> {
+pub async fn run_flashwriter(
+    state: Arc<AppState>,
+    target: FlashWriterTarget,
+    package: PathBuf,
+) -> AppResult<()> {
+    let generation = target.generation;
+    let started = std::time::Instant::now();
     let worker_state = state.clone();
 
     let result = match tokio::task::spawn_blocking(move || {
-        flash_gen4_sync(&worker_state, &target, &package)
+        flashwriter_sync(&worker_state, &target, &package)
     })
     .await
     {
         Ok(result) => result,
-        Err(error) => Err(AppError::Msg(format!("Gen4 flash worker failed: {error}"))),
+        Err(error) => Err(AppError::Msg(format!(
+            "Gen{generation} flash worker failed: {error}"
+        ))),
     };
 
-    notify(&state, 4, result.is_ok()).await;
+    global_metrics().record_firmware_flash(
+        generation,
+        result.is_ok(),
+        started.elapsed().as_secs_f64(),
+    );
+    notify(&state, generation, result.is_ok()).await;
     result
 }
 
@@ -427,6 +454,7 @@ fn contains_success_marker(path: &Path) -> AppResult<bool> {
 /// Success requires BOTH a zero exit status and the legacy success marker.
 /// stdout/stderr stream to disk rather than accumulating in memory.
 pub async fn run_gen5(state: Arc<AppState>, job: Gen5Job) -> AppResult<()> {
+    let started = std::time::Instant::now();
     let result: AppResult<()> = async {
         let hil = fs::canonicalize(job.package.join("HIL"))?;
 
@@ -471,6 +499,74 @@ pub async fn run_gen5(state: Arc<AppState>, job: Gen5Job) -> AppResult<()> {
     }
     .await;
 
+    global_metrics().record_firmware_flash(5, result.is_ok(), started.elapsed().as_secs_f64());
     notify(&state, 5, result.is_ok()).await;
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        completion_endpoint, contains_success_marker, preflight_flashwriter, supports_relay_flash,
+        FLASHWRITER, IMAGES,
+    };
+    use std::{fs, os::unix::fs::symlink};
+
+    fn complete_package() -> tempfile::TempDir {
+        let package = tempfile::tempdir().unwrap();
+        fs::write(package.path().join(FLASHWRITER), b"flashwriter").unwrap();
+        for image in &IMAGES {
+            fs::write(package.path().join(image.name), b"image").unwrap();
+        }
+        package
+    }
+
+    #[test]
+    fn gen3_and_gen4_share_the_relay_flash_protocol() {
+        assert!(supports_relay_flash(3));
+        assert!(supports_relay_flash(4));
+        assert!(!supports_relay_flash(5));
+        assert_eq!(completion_endpoint(3), "flash-confirm-gen4");
+        assert_eq!(completion_endpoint(4), "flash-confirm-gen4");
+        assert_eq!(completion_endpoint(5), "flash-confirm");
+    }
+
+    #[test]
+    fn preflight_accepts_a_complete_nonempty_package() {
+        let package = complete_package();
+        assert!(preflight_flashwriter(package.path()).is_ok());
+    }
+
+    #[test]
+    fn preflight_rejects_missing_and_empty_images() {
+        let package = complete_package();
+        fs::remove_file(package.path().join(IMAGES[0].name)).unwrap();
+        assert!(preflight_flashwriter(package.path()).is_err());
+
+        fs::write(package.path().join(IMAGES[0].name), []).unwrap();
+        assert!(preflight_flashwriter(package.path()).is_err());
+    }
+
+    #[test]
+    fn preflight_rejects_an_image_symlink_outside_the_package() {
+        let package = complete_package();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let image = package.path().join(IMAGES[0].name);
+        fs::remove_file(&image).unwrap();
+        symlink(outside.path(), image).unwrap();
+
+        assert!(preflight_flashwriter(package.path()).is_err());
+    }
+
+    #[test]
+    fn success_marker_is_detected_across_read_boundaries() {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let mut contents = vec![b'x'; 4090];
+        contents.extend_from_slice(b"Flash process completed successfully\n");
+        fs::write(log.path(), contents).unwrap();
+        assert!(contains_success_marker(log.path()).unwrap());
+
+        fs::write(log.path(), b"Flash process failed").unwrap();
+        assert!(!contains_success_marker(log.path()).unwrap());
+    }
 }

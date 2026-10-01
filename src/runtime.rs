@@ -2,15 +2,12 @@ use anyhow::{anyhow, Context, Result};
 use std::{
     net::SocketAddr,
     sync::{atomic::Ordering, Arc},
+    time::Duration,
 };
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::{
-    config,
-    hardware,
-    models,
-    state::AppState,
-    store,
+    config, hardware, models, observability::metrics::global_metrics, state::AppState, store,
 };
 
 /// Read the selected interface's MAC and IPv4 address.
@@ -40,19 +37,28 @@ pub fn interface_identity(interface: &str) -> Result<(String, String)> {
     Ok((mac, address))
 }
 
-/// Single-shot registration before the controller starts serving live traffic.
+const REGISTRATION_RETRY_INITIAL: Duration = Duration::from_secs(2);
+const REGISTRATION_RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// Register the controller, retrying transient backend and transport failures.
 ///
-/// The backend creates the session or device record after receiving this POST.
-/// The code intentionally does not retry here because the requirement is to send
-/// one registration message once per process lifetime, immediately after the
-/// listener is bound and ready for the peer to connect back to us.
+/// Only one registration task may run per process. That task remains active
+/// until the backend accepts the controller or service shutdown begins.
 pub async fn registration_loop(state: Arc<AppState>, inventory: Vec<models::RelayInventory>) {
+    registration_loop_with_delay(state, inventory, REGISTRATION_RETRY_INITIAL).await;
+}
+
+async fn registration_loop_with_delay(
+    state: Arc<AppState>,
+    inventory: Vec<models::RelayInventory>,
+    initial_delay: Duration,
+) {
     let url = format!(
         "http://{}:{}/api/v1/device/controller/",
         state.cfg.server_ip, state.cfg.http_port
     );
 
-    if *state.reboot.read().await {
+    if state.jobs.is_closing() {
         warn!("registration skipped because the controller is already shutting down");
         return;
     }
@@ -62,37 +68,37 @@ pub async fn registration_loop(state: Arc<AppState>, inventory: Vec<models::Rela
         return;
     }
 
-    let payload = state.registration_payload(inventory).await;
+    let mut retry_delay = initial_delay;
 
-    info!(%url, "registering controller with backend once at process startup");
-    debug!(payload = ?payload, "registration payload prepared for backend");
+    loop {
+        if state.jobs.is_closing() {
+            info!("backend registration stopped during service shutdown");
+            return;
+        }
 
-    match serde_json::to_string_pretty(&payload) {
-        Ok(json) => info!(body = %json, "backend registration payload"),
-        Err(error) => warn!(%error, "failed to pretty-print registration payload for logging"),
-    }
+        let payload = state.registration_payload(inventory.clone()).await;
+        info!(%url, "registering controller with backend");
 
-    match state.client.post(&url).json(&payload).send().await {
-        Ok(response) => {
-            let status = response.status();
-            match response.text().await {
-                Ok(body) => {
-                    info!(status = %status, body = %body, "registration response received");
-
-                    if status.is_success() {
-                        info!("controller registration request accepted by backend");
-                    } else {
-                        warn!(status = %status, body = %body, "backend rejected registration request");
-                    }
+        match state.client.post(&url).json(&payload).send().await {
+            Ok(response) => {
+                let status = response.status();
+                if status.is_success() {
+                    global_metrics().record_registration_attempt("accepted");
+                    info!(status = %status, "controller registration request accepted by backend");
+                    return;
                 }
-                Err(error) => {
-                    warn!(%error, "failed to read backend registration response body");
-                }
+
+                global_metrics().record_registration_attempt("rejected");
+                warn!(status = %status, "backend rejected registration request; retrying");
+            }
+            Err(error) => {
+                global_metrics().record_registration_attempt("transport_error");
+                warn!(%error, "registration HTTP request failed; retrying");
             }
         }
-        Err(error) => {
-            warn!(%error, "registration HTTP request failed; backend may still be starting");
-        }
+
+        tokio::time::sleep(retry_delay).await;
+        retry_delay = (retry_delay * 2).min(REGISTRATION_RETRY_MAX);
     }
 }
 
@@ -108,7 +114,9 @@ pub async fn stop_captures(state: &AppState) {
             session.stop.store(true, Ordering::Release);
         }
 
-        std::mem::take(&mut *active)
+        let sessions = std::mem::take(&mut *active);
+        global_metrics().set_active_captures(0);
+        sessions
     };
 
     for (tty, mut session) in sessions {
@@ -164,8 +172,8 @@ pub fn check_offline(
         }
     }
 
-    let policy = hardware::HardwarePolicy::load(hardware_path)
-        .context("validating hardware policy")?;
+    let policy =
+        hardware::HardwarePolicy::load(hardware_path).context("validating hardware policy")?;
 
     let (usb, gen5) = store::load_mappings(
         Path::new(config::USB_MAPPING_FILE),
@@ -201,12 +209,93 @@ pub fn check_offline(
 
 #[cfg(test)]
 mod tests {
-    use super::interface_identity;
+    use super::{interface_identity, registration_loop_with_delay};
+    use crate::{
+        cli::FeatureFlags,
+        config::AppConfig,
+        hardware::HardwarePolicy,
+        jobs::Jobs,
+        models::Generation,
+        relay::RelayController,
+        state::{AppState, ControllerInfo},
+    };
+    use axum::{http::StatusCode, routing::post, Router};
+    use std::{
+        collections::HashMap,
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
+    use tokio::sync::{Mutex, RwLock};
 
     #[test]
     fn invalid_interface_names_are_rejected() {
         for value in ["", "..", "not/valid", "bad name"] {
-            assert!(interface_identity(value).is_err(), "accepted invalid value: {value}");
+            assert!(
+                interface_identity(value).is_err(),
+                "accepted invalid value: {value}"
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn registration_retries_until_backend_accepts_request() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let handler_attempts = attempts.clone();
+        let app = Router::new().route(
+            "/api/v1/device/controller/",
+            post(move || {
+                let attempts = handler_attempts.clone();
+                async move {
+                    if attempts.fetch_add(1, Ordering::AcqRel) == 0 {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        StatusCode::OK
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let state = Arc::new(AppState {
+            cfg: AppConfig {
+                server_ip: "127.0.0.1".into(),
+                http_port: port,
+                ws_port: 1,
+                gen: Generation::Gen4,
+                bind_port: 8888,
+                iface_name: "eth0".into(),
+            },
+            controller: RwLock::new(ControllerInfo {
+                board_mac: "001122334455".into(),
+                board_ip: "127.0.0.1".into(),
+                uid: None,
+            }),
+            usb_map: RwLock::new(HashMap::new()),
+            gen5_map: RwLock::new(HashMap::new()),
+            rtos_sessions: Mutex::new(HashMap::new()),
+            relay: RelayController::new(),
+            deletion_requested: AtomicBool::new(false),
+            client: reqwest::Client::new(),
+            jobs: Jobs::default(),
+            api_token: None,
+            hardware: HardwarePolicy { boards: Vec::new() },
+            features: FeatureFlags::default(),
+            registration_done: AtomicBool::new(false),
+        });
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            registration_loop_with_delay(state, Vec::new(), Duration::from_millis(5)),
+        )
+        .await
+        .expect("registration should retry promptly");
+
+        assert_eq!(attempts.load(Ordering::Acquire), 2);
+        server.abort();
     }
 }

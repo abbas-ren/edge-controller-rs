@@ -52,7 +52,7 @@ impl HardwarePolicy {
         Ok(policy)
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn validate(&mut self) -> AppResult<()> {
         self.validate_with_features(&FeatureFlags::default())
     }
@@ -63,7 +63,10 @@ impl HardwarePolicy {
         let mut relay_channels = HashSet::new();
         let mut gpios = HashSet::new();
 
-        tracing::info!(board_count = self.boards.len(), "validating hardware policy bindings");
+        tracing::info!(
+            board_count = self.boards.len(),
+            "validating hardware policy bindings"
+        );
 
         for board in &mut self.boards {
             board.mac = crate::store::checked_mac(&board.mac)?;
@@ -82,14 +85,10 @@ impl HardwarePolicy {
             }
 
             let identities_for_board: Vec<&UsbIdentity> = if features.rtos {
-                [
-                    Some(&board.uart),
-                    board.power.as_ref(),
-                    board.rtos.as_ref(),
-                ]
-                .into_iter()
-                .flatten()
-                .collect()
+                [Some(&board.uart), board.power.as_ref(), board.rtos.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .collect()
             } else {
                 [Some(&board.uart), board.power.as_ref()]
                     .into_iter()
@@ -227,7 +226,10 @@ impl HardwarePolicy {
             );
         }
 
-        tracing::info!(approved_boards = self.boards.len(), "hardware policy validation succeeded");
+        tracing::info!(
+            approved_boards = self.boards.len(),
+            "hardware policy validation succeeded"
+        );
         Ok(())
     }
 

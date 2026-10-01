@@ -10,7 +10,18 @@ use std::{future::Future, sync::Arc};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::task::TaskTracker;
 
-pub type Lease = Arc<OwnedSemaphorePermit>;
+pub type Lease = Arc<HardwareLease>;
+
+#[derive(Debug)]
+pub struct HardwareLease {
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Drop for HardwareLease {
+    fn drop(&mut self) {
+        crate::observability::metrics::global_metrics().set_hardware_operation_active(false);
+    }
+}
 
 #[derive(Debug)]
 pub struct Jobs {
@@ -33,7 +44,10 @@ impl Jobs {
         self.gate
             .clone()
             .try_acquire_owned()
-            .map(Arc::new)
+            .map(|permit| {
+                crate::observability::metrics::global_metrics().set_hardware_operation_active(true);
+                Arc::new(HardwareLease { _permit: permit })
+            })
             .map_err(|_| {
                 if self.gate.is_closed() {
                     "controller is shutting down"
@@ -69,5 +83,35 @@ impl Jobs {
     pub async fn wait(&self) {
         self.tracker.close();
         self.tracker.wait().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Jobs;
+
+    #[test]
+    fn hardware_operations_are_serialized_until_lease_is_released() {
+        let jobs = Jobs::default();
+        let lease = jobs
+            .try_enter()
+            .expect("first operation should be admitted");
+
+        assert_eq!(
+            jobs.try_enter().unwrap_err(),
+            "another hardware operation is active"
+        );
+
+        drop(lease);
+        assert!(jobs.try_enter().is_ok());
+    }
+
+    #[test]
+    fn shutdown_rejects_new_hardware_operations() {
+        let jobs = Jobs::default();
+        jobs.begin_shutdown();
+
+        assert!(jobs.is_closing());
+        assert_eq!(jobs.try_enter().unwrap_err(), "controller is shutting down");
     }
 }

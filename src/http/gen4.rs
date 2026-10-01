@@ -1,12 +1,15 @@
+//! Gen3/Gen4 FlashWriter and shared device-control HTTP adapters.
+
 use axum::{
     extract::{Extension, State},
-    Json,
     response::Response,
+    Json,
 };
 use std::sync::Arc;
 
 use crate::{jobs::Lease, state::AppState};
 
+/// Accept a generation-specific firmware flash request.
 pub async fn ipl_run_handler(
     State(state): State<Arc<AppState>>,
     Extension(lease): Extension<Lease>,
@@ -15,6 +18,7 @@ pub async fn ipl_run_handler(
     super::ipl_run(State(state), Extension(lease), Json(request)).await
 }
 
+/// Put the configured Gen3/Gen4 board into download mode.
 pub async fn ipl_mode_handler(
     State(state): State<Arc<AppState>>,
     Extension(lease): Extension<Lease>,
@@ -23,6 +27,7 @@ pub async fn ipl_mode_handler(
     super::ipl_mode(State(state), Extension(lease), Json(request)).await
 }
 
+/// Restore the configured Gen3/Gen4 board's default boot mode.
 pub async fn ipl_mode_default_handler(
     State(state): State<Arc<AppState>>,
     Extension(lease): Extension<Lease>,
@@ -31,6 +36,7 @@ pub async fn ipl_mode_default_handler(
     super::ipl_mode_default(State(state), Extension(lease), Json(request)).await
 }
 
+/// Power-cycle a mapped Gen5 board through its CPLD power interface.
 pub async fn reboot_device_handler(
     State(state): State<Arc<AppState>>,
     Extension(lease): Extension<Lease>,
@@ -39,6 +45,7 @@ pub async fn reboot_device_handler(
     super::reboot_device(State(state), Extension(lease), Json(request)).await
 }
 
+/// Remove a validated firmware package directory.
 pub async fn ipl_remove_handler(
     State(state): State<Arc<AppState>>,
     Json(request): Json<super::RemoveIplRequest>,

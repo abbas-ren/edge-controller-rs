@@ -5,8 +5,8 @@ mod rtos;
 
 use crate::{jobs::Lease, state::RtosSession};
 use axum::{
-    body::{to_bytes, Body},
-    extract::{Extension, State},
+    body::Body,
+    extract::{Extension, MatchedPath, State},
     http::{header, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -31,8 +31,8 @@ use crate::store::{Gen5Mappings, UsbMappings};
 use crate::{
     config::*,
     ipl,
-    observability::metrics::global_metrics,
     models::*,
+    observability::metrics::global_metrics,
     state::AppState,
     uart::{open_uart, write_to_path},
     usb::*,
@@ -59,7 +59,11 @@ static MAPPING_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// leak without introducing an additional authentication dependency.
 fn token_matches(expected: &[u8], supplied: &[u8]) -> bool {
     if expected.len() != supplied.len() {
-        debug!(expected_len = expected.len(), supplied_len = supplied.len(), "API token length mismatch");
+        debug!(
+            expected_len = expected.len(),
+            supplied_len = supplied.len(),
+            "API token length mismatch"
+        );
         return false;
     }
 
@@ -78,89 +82,79 @@ fn token_matches(expected: &[u8], supplied: &[u8]) -> bool {
     matches
 }
 
+fn is_hardware_operation(path: &str) -> bool {
+    matches!(
+        path,
+        "/relay"
+            | "/relay/status"
+            | "/relay/config"
+            | "/relay/delete"
+            | "/devCon/delete"
+            | "/ipl"
+            | "/ipl-mode"
+            | "/ipl-mode/default"
+            | "/gen5/tty_entry"
+            | "/gen5/power"
+            | "/mapping/entry"
+            | "/reboot-device"
+            | "/ipl/remove"
+            | "/rtos/start"
+            | "/rtos/end"
+    )
+}
+
 async fn request_guard(
     State(state): State<Arc<AppState>>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
     let method = request.method().clone();
-    let path = request.uri().path().to_owned();
+    let metric_route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(MatchedPath::as_str)
+        .unwrap_or("unmatched")
+        .to_owned();
     let started = std::time::Instant::now();
     let response = guarded_request(state, request, next).await;
 
     global_metrics().record_http_request(
         method.as_str(),
-        path.as_str(),
+        metric_route.as_str(),
         response.status().as_u16(),
         started.elapsed().as_secs_f64(),
     );
+    if is_hardware_operation(&metric_route) {
+        global_metrics().record_hardware_operation(
+            metric_route.trim_start_matches('/'),
+            response.status().is_success(),
+        );
+    }
 
     response
 }
 
-async fn guarded_request(
-    state: Arc<AppState>,
-    mut request: Request<Body>,
-    next: Next,
-) -> Response {
+async fn guarded_request(state: Arc<AppState>, mut request: Request<Body>, next: Next) -> Response {
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
-    let query = request.uri().query().map(str::to_owned);
     let content_type = request
         .headers()
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
+    let content_length = request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
 
-    let body_for_logging = std::mem::take(request.body_mut());
-    let payload = match to_bytes(body_for_logging, 64 * 1024).await {
-        Ok(bytes) => {
-            if !bytes.is_empty() {
-                *request.body_mut() = Body::from(bytes.clone());
-                Some(bytes)
-            } else {
-                None
-            }
-        }
-        Err(error) => {
-            warn!(%method, %path, %error, "failed to read request body for API logging");
-            None
-        }
-    };
-
-    match payload {
-        Some(body) => {
-            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) {
-                info!(
-                    method = %method,
-                    path = %path,
-                    query = ?query,
-                    content_type = ?content_type,
-                    payload = ?json,
-                    "router API request received"
-                );
-            } else {
-                let preview = String::from_utf8_lossy(&body);
-                info!(
-                    method = %method,
-                    path = %path,
-                    query = ?query,
-                    content_type = ?content_type,
-                    payload_preview = %preview,
-                    "router API request received"
-                );
-            }
-        }
-        None => {
-            info!(
-                method = %method,
-                path = %path,
-                query = ?query,
-                content_type = ?content_type,
-                "router API request received without a body"
-            );
-        }
-    }
+    info!(
+        method = %method,
+        path = %path,
+        content_type = ?content_type,
+        content_length = ?content_length,
+        "router API request received"
+    );
 
     debug!(path = %request.uri(), "HTTP request entering request guard");
 
@@ -177,24 +171,43 @@ async fn guarded_request(
         }
     }
 
-    let is_gen3_or_gen4 = matches!(path.as_str(), "/relay" | "/relay/status" | "/relay/config" | "/relay/delete" | "/devCon/delete" | "/mapping/entry" | "/reboot-device" | "/ipl" | "/ipl-mode" | "/ipl-mode/default" | "/ipl/remove")
-        && !(state.features.gen3 || state.features.gen4);
-    let is_gen5 = matches!(path.as_str(), "/gen5/tty_entry" | "/gen5/power" | "/mapping/entry" | "/reboot-device" | "/ipl" | "/ipl-mode" | "/ipl-mode/default" | "/ipl/remove") && !state.features.gen5;
+    let relay_feature_disabled = matches!(
+        path.as_str(),
+        "/relay"
+            | "/relay/status"
+            | "/relay/config"
+            | "/relay/delete"
+            | "/devCon/delete"
+            | "/ipl-mode"
+            | "/ipl-mode/default"
+    ) && !(state.features.gen3 || state.features.gen4);
+    let gen5_feature_disabled = matches!(
+        path.as_str(),
+        "/gen5/tty_entry" | "/gen5/power" | "/mapping/entry" | "/reboot-device"
+    ) && !state.features.gen5;
+    let ipl_feature_disabled = matches!(path.as_str(), "/ipl" | "/ipl/remove")
+        && !(state.features.gen3 || state.features.gen4 || state.features.gen5);
     if (path.as_str() == "/rtos/start" || path.as_str() == "/rtos/end") && !state.features.rtos {
         return error_response(
             "RTOS capture is disabled; start the service with --enable-rtos",
             StatusCode::NOT_IMPLEMENTED,
         );
     }
-    if is_gen3_or_gen4 {
+    if relay_feature_disabled {
         return error_response(
             "Gen3/Gen4 functionality is disabled; start the service with --enable-gen3 or --enable-gen4",
             StatusCode::NOT_IMPLEMENTED,
         );
     }
-    if is_gen5 {
+    if gen5_feature_disabled {
         return error_response(
             "Gen5 functionality is disabled; start the service with --enable-gen5",
+            StatusCode::NOT_IMPLEMENTED,
+        );
+    }
+    if ipl_feature_disabled {
+        return error_response(
+            "IPL functionality is disabled; enable Gen3, Gen4, or Gen5",
             StatusCode::NOT_IMPLEMENTED,
         );
     }
@@ -208,24 +221,7 @@ async fn guarded_request(
 
     let path = request.uri().path().to_owned();
 
-    let hardware_operation = matches!(
-        path.as_str(),
-        "/relay"
-            | "/relay/status"
-            | "/relay/config"
-            | "/relay/delete"
-            | "/devCon/delete"
-            | "/ipl"
-            | "/ipl-mode"
-            | "/ipl-mode/default"
-            | "/gen5/tty_entry"
-            | "/gen5/power"
-            | "/mapping/entry"
-            | "/reboot-device"
-            | "/ipl/remove"
-            | "/rtos/start"
-            | "/rtos/end"
-    );
+    let hardware_operation = is_hardware_operation(path.as_str());
 
     if !hardware_operation {
         tracing::debug!(path = %request.uri(), "non-hardware request passed through without a lease");
@@ -318,56 +314,20 @@ fn validate_csv_field(name: &str, value: &str) -> crate::error::AppResult<()> {
     Ok(())
 }
 
-/// Replace a mapping file atomically.
-///
-/// The temporary file lives in the destination directory, so rename does
-/// not cross filesystem boundaries. Readers see either the old complete
-/// file or the new complete file.
-///
-/// The file contents are synchronized before rename. This is not a full
-/// power-loss durability guarantee because the parent directory is not
-/// synchronized after rename.
-#[allow(dead_code)]
-fn atomic_mapping_write(destination: &str, contents: &[u8]) -> crate::error::AppResult<()> {
-    use crate::error::AppError;
-    use std::os::unix::fs::PermissionsExt;
-
-    let destination = Path::new(destination);
-    tracing::debug!(path = %destination.display(), bytes = contents.len(), "writing mapping file atomically");
-
-    let parent = destination
-        .parent()
-        .ok_or_else(|| AppError::Msg("mapping file has no parent directory".into()))?;
-
-    fs::create_dir_all(parent)?;
-
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    temporary
-        .as_file()
-        .set_permissions(fs::Permissions::from_mode(0o640))?;
-    temporary.write_all(contents)?;
-    temporary.as_file().sync_all()?;
-
-    temporary
-        .persist(destination)
-        .map_err(|error| {
-            tracing::error!(path = %destination.display(), error = %error, "mapping file persist failed");
-            AppError::Io(error.error)
-        })?;
-
-    tracing::info!(path = %destination.display(), bytes = contents.len(), "mapping file persisted");
-    Ok(())
-}
-
 /// Call only from blocking workers while holding MAPPING_LOCK.
 fn persist_usb_mappings(state: &AppState, mappings: &UsbMappings) -> crate::error::AppResult<()> {
     let other = state.gen5_map.blocking_read();
 
-    tracing::debug!(usb_count = mappings.len(), gen5_count = other.len(), "persisting USB mappings");
+    tracing::debug!(
+        usb_count = mappings.len(),
+        gen5_count = other.len(),
+        "persisting USB mappings"
+    );
     crate::store::validate_snapshot(mappings, &other, &state.hardware)?;
 
     let contents = crate::store::encode_usb(mappings)?;
     crate::store::atomic_replace(Path::new(USB_MAPPING_FILE), contents.as_bytes())?;
+    global_metrics().set_mapping_counts(mappings.len(), other.len());
 
     tracing::info!(usb_count = mappings.len(), path = %USB_MAPPING_FILE, "USB mapping state persisted");
     Ok(())
@@ -377,11 +337,16 @@ fn persist_usb_mappings(state: &AppState, mappings: &UsbMappings) -> crate::erro
 fn persist_gen5_mappings(state: &AppState, mappings: &Gen5Mappings) -> crate::error::AppResult<()> {
     let other = state.usb_map.blocking_read();
 
-    tracing::debug!(gen5_count = mappings.len(), usb_count = other.len(), "persisting Gen5 mappings");
+    tracing::debug!(
+        gen5_count = mappings.len(),
+        usb_count = other.len(),
+        "persisting Gen5 mappings"
+    );
     crate::store::validate_snapshot(&other, mappings, &state.hardware)?;
 
     let contents = crate::store::encode_gen5(mappings)?;
     crate::store::atomic_replace(Path::new(GEN5_MAPPING_FILE), contents.as_bytes())?;
+    global_metrics().set_mapping_counts(other.len(), mappings.len());
 
     tracing::info!(gen5_count = mappings.len(), path = %GEN5_MAPPING_FILE, "Gen5 mapping state persisted");
     Ok(())
@@ -407,7 +372,10 @@ where
 {
     use crate::error::AppError;
 
-    tracing::debug!(off_delay_ms = off_delay.as_millis(), "starting board power-cycle probe");
+    tracing::debug!(
+        off_delay_ms = off_delay.as_millis(),
+        "starting board power-cycle probe"
+    );
 
     let observation = (|| {
         set_power(false)?;
@@ -450,41 +418,6 @@ where
             )))
         }
     }
-}
-
-/// Avoid treating the FTDI relay controller itself as a board console.
-///
-/// An FTDI relay can initially have a ttyUSB node before its kernel driver
-/// is detached for libusb access. This helper exists to make that distinction
-/// explicit while debugging board enumeration problems.
-#[allow(dead_code)]
-fn is_relay_tty(tty: &str) -> bool {
-    let Some(name) = Path::new(tty).file_name() else {
-        debug!(tty = %tty, "relay tty check skipped because path has no file name");
-        return false;
-    };
-
-    let device_path = Path::new("/sys/class/tty").join(name).join("device");
-
-    let Ok(canonical_path) = fs::canonicalize(&device_path) else {
-        debug!(tty = %tty, path = %device_path.display(), "relay tty sysfs path not found");
-        return false;
-    };
-
-    let matches = canonical_path.ancestors().any(|ancestor| {
-        let vendor = fs::read_to_string(ancestor.join("idVendor"));
-        let product = fs::read_to_string(ancestor.join("idProduct"));
-
-        matches!(
-            (vendor, product),
-            (Ok(vendor), Ok(product))
-                if vendor.trim().eq_ignore_ascii_case("0403")
-                    && product.trim().eq_ignore_ascii_case("6001")
-        )
-    });
-
-    debug!(tty = %tty, is_relay = matches, "relay tty classification result");
-    matches
 }
 
 /// Discover a Gen3/Gen4 console using a specific relay channel.
@@ -710,14 +643,54 @@ async fn health_handler() -> Response {
     ok().into_response()
 }
 
+fn readiness_status(uid_present: bool, shutting_down: bool) -> StatusCode {
+    if uid_present && !shutting_down {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
+async fn readiness_handler(State(state): State<Arc<AppState>>) -> Response {
+    let registered = state.controller.read().await.uid.is_some();
+    let shutting_down = state.jobs.is_closing();
+    let status = readiness_status(registered, shutting_down);
+
+    (
+        status,
+        Json(serde_json::json!({
+            "ready": status == StatusCode::OK,
+            "registered": registered,
+            "shutting_down": shutting_down,
+        })),
+    )
+        .into_response()
+}
+
 async fn status_handler(State(state): State<Arc<AppState>>) -> Response {
-    let controller = state.controller.read().await;
+    let (board_mac, board_ip, uid) = {
+        let controller = state.controller.read().await;
+        (
+            controller.board_mac.clone(),
+            controller.board_ip.clone(),
+            controller.uid.clone(),
+        )
+    };
+    let usb_mapping_count = state.usb_map.read().await.len();
+    let gen5_mapping_count = state.gen5_map.read().await.len();
+    let active_capture_count = state.rtos_sessions.lock().await.len();
     let payload = serde_json::json!({
         "status": "ok",
         "generation": state.cfg.gen.as_int(),
-        "board_mac": controller.board_mac,
-        "board_ip": controller.board_ip,
-        "uid": controller.uid,
+        "board_mac": board_mac,
+        "board_ip": board_ip,
+        "uid": uid,
+        "registered": uid.is_some(),
+        "shutting_down": state.jobs.is_closing(),
+        "deletion_requested": state.deletion_requested(),
+        "usb_mapping_count": usb_mapping_count,
+        "gen5_mapping_count": gen5_mapping_count,
+        "active_capture_count": active_capture_count,
         "features": {
             "gen3": state.features.gen3,
             "gen4": state.features.gen4,
@@ -730,7 +703,15 @@ async fn status_handler(State(state): State<Arc<AppState>>) -> Response {
 
 async fn metrics_handler() -> Response {
     let output = global_metrics().render();
-    (StatusCode::OK, output).into_response()
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            crate::observability::metrics::PROMETHEUS_CONTENT_TYPE,
+        )],
+        output,
+    )
+        .into_response()
 }
 
 fn ok() -> Json<serde_json::Value> {
@@ -757,16 +738,21 @@ fn error_response(message: impl AsRef<str>, status: StatusCode) -> Response {
 
 macro_rules! log_handler_request {
     ($handler:literal, $request:expr) => {
-        info!(handler = $handler, request = ?$request, "API handler invoked");
+        let _ = &$request;
+        info!(handler = $handler, "API handler invoked");
     };
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
     let mut router = Router::new()
         .route("/health", get(health_handler))
+        .route("/ready", get(readiness_handler))
         .route("/status", get(status_handler))
         .route("/metrics", get(metrics_handler))
-        .route("/swagger.json", get(crate::observability::swagger::swagger_json))
+        .route(
+            "/swagger.json",
+            get(crate::observability::swagger::swagger_json),
+        )
         .route("/docs", get(crate::observability::swagger::swagger_ui))
         .route("/confirmation", post(confirmation));
 
@@ -777,22 +763,22 @@ pub fn router(state: Arc<AppState>) -> Router {
             .route("/relay/config", post(relay::relay_config_handler))
             .route("/relay/delete", post(relay::relay_delete_handler))
             .route("/devCon/delete", post(relay::devcon_delete_handler))
-            .route("/mapping/entry", post(gen5::mapping_entry_handler))
-            .route("/reboot-device", post(gen4::reboot_device_handler));
+            .route("/ipl-mode", post(gen4::ipl_mode_handler))
+            .route("/ipl-mode/default", post(gen4::ipl_mode_default_handler));
     }
 
-    if state.features.gen4 || state.features.gen5 {
+    if state.features.gen3 || state.features.gen4 || state.features.gen5 {
         router = router
             .route("/ipl", post(gen4::ipl_run_handler))
-            .route("/ipl-mode", post(gen4::ipl_mode_handler))
-            .route("/ipl-mode/default", post(gen4::ipl_mode_default_handler))
             .route("/ipl/remove", post(gen4::ipl_remove_handler));
     }
 
     if state.features.gen5 {
         router = router
             .route("/gen5/tty_entry", post(gen5::gen5_tty_entry_handler))
-            .route("/gen5/power", post(gen5::gen5_power_handler));
+            .route("/gen5/power", post(gen5::gen5_power_handler))
+            .route("/mapping/entry", post(gen5::mapping_entry_handler))
+            .route("/reboot-device", post(gen4::reboot_device_handler));
     }
 
     if state.features.rtos {
@@ -813,17 +799,24 @@ fn required<T>(value: Option<T>, field: &str) -> crate::error::AppResult<T> {
     })
 }
 
-async fn gen4_target(
+async fn flashwriter_target(
     state: &AppState,
+    generation: u8,
     mac: String,
     serial: String,
     channel: u8,
     gpio1: u32,
     gpio2: u32,
-) -> crate::error::AppResult<ipl::Gen4Target> {
+) -> crate::error::AppResult<ipl::FlashWriterTarget> {
+    if !ipl::supports_relay_flash(generation) || !state.features.generation_enabled(generation) {
+        return Err(crate::error::AppError::Msg(format!(
+            "Gen{generation} relay flashing is not enabled"
+        )));
+    }
+
     let mac = validated_mac(&mac)?;
     validate_csv_field("serial", &serial)?;
-    let approved = state.hardware.board(&mac, 4)?;
+    let approved = state.hardware.board(&mac, generation)?;
     let approved_relay = approved
         .relay
         .as_ref()
@@ -861,7 +854,8 @@ async fn gen4_target(
         ));
     }
 
-    Ok(ipl::Gen4Target {
+    Ok(ipl::FlashWriterTarget {
+        generation,
         tty,
         mac,
         serial,
@@ -872,7 +866,7 @@ async fn gen4_target(
 }
 
 enum PreparedFlash {
-    Gen4(ipl::Gen4Target, std::path::PathBuf),
+    FlashWriter(ipl::FlashWriterTarget, std::path::PathBuf),
     Gen5(ipl::Gen5Job),
 }
 
@@ -884,9 +878,10 @@ async fn prepare_flash(
     let path = required(request.path, "path")?;
 
     match request.gen {
-        4 => {
-            let target = gen4_target(
+        generation @ (3 | 4) => {
+            let target = flashwriter_target(
                 state,
+                generation,
                 mac,
                 required(request.serial, "serial")?,
                 required(request.channel, "channel")?,
@@ -897,13 +892,13 @@ async fn prepare_flash(
 
             let package = task::spawn_blocking(move || {
                 let package = ipl::package_directory(&path)?;
-                ipl::preflight_gen4(&package)?;
+                ipl::preflight_flashwriter(&package)?;
                 Ok::<_, crate::error::AppError>(package)
             })
             .await
             .map_err(|error| crate::error::AppError::Msg(error.to_string()))??;
 
-            Ok(PreparedFlash::Gen4(target, package))
+            Ok(PreparedFlash::FlashWriter(target, package))
         }
         5 => {
             let uart = checked_tty(&required(request.uart, "uart")?)?;
@@ -984,7 +979,7 @@ async fn prepare_flash(
             }))
         }
         _ => Err(crate::error::AppError::Msg(
-            "IPL supports gen 4 and gen 5; no Gen3 flash protocol was supplied".into(),
+            "IPL supports generation 3, 4, or 5".into(),
         )),
     }
 }
@@ -1011,8 +1006,8 @@ async fn ipl_run(
 
     state.jobs.spawn(lease, async move {
         let result = match prepared {
-            PreparedFlash::Gen4(target, package) => {
-                ipl::run_gen4(worker_state, target, package).await
+            PreparedFlash::FlashWriter(target, package) => {
+                ipl::run_flashwriter(worker_state, target, package).await
             }
             PreparedFlash::Gen5(job) => ipl::run_gen5(worker_state, job).await,
         };
@@ -1040,8 +1035,10 @@ async fn execute_ipl_mode(
     request: IplModeRequest,
     download: bool,
 ) -> Response {
-    let target = match gen4_target(
+    let generation = state.cfg.gen.as_int();
+    let target = match flashwriter_target(
         &state,
+        generation,
         request.mac,
         request.serial,
         request.channel,
@@ -1290,8 +1287,7 @@ async fn devcon_delete(
             return error_response(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR);
         }
 
-        // Means "stop this service", not "reboot the Raspberry Pi".
-        *state.reboot.write().await = true;
+        state.request_deletion();
     }
 
     info!(handler = "devcon_delete", status = %StatusCode::OK, "device mapping deletion completed");
@@ -1909,6 +1905,7 @@ async fn rtos_start(
             handle: Some(handle),
         },
     );
+    global_metrics().set_active_captures(sessions.len());
 
     info!(handler = "rtos_start", mac = %session_key_for_log, tty = %tty_for_log, "RTOS capture started");
     ok().into_response()
@@ -1939,6 +1936,7 @@ async fn rtos_end(
     let Some(mut session) = sessions.remove(&session_key) else {
         return (StatusCode::OK, "").into_response();
     };
+    global_metrics().set_active_captures(sessions.len());
 
     let tty = session.tty.clone();
 
@@ -2014,8 +2012,7 @@ async fn notify_relay_config(
     let status = response.status();
 
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_else(|_| "<unreadable>".to_owned());
-        tracing::warn!(%mac, %status, body = %body, "relay-config confirmation rejected by backend");
+        tracing::warn!(%mac, %status, "relay-config confirmation rejected by backend");
         return Ok(());
     }
 
@@ -2054,8 +2051,7 @@ async fn notify_gen5_mapping(
     let status = response.status();
 
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_else(|_| "<unreadable>".to_owned());
-        tracing::warn!(%mac, %status, body = %body, "Gen5 mapping notification rejected by backend");
+        tracing::warn!(%mac, %status, "Gen5 mapping notification rejected by backend");
         return Ok(());
     }
 
@@ -2247,7 +2243,71 @@ async fn mapped_power_tty(state: &AppState, supplied: &str) -> crate::error::App
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_uboot_mac, validated_mac};
+    use super::{extract_uboot_mac, readiness_status, router, validated_mac};
+    use crate::{
+        config::AppConfig,
+        hardware::HardwarePolicy,
+        jobs::Jobs,
+        models::Generation,
+        relay::RelayController,
+        state::{AppState, ControllerInfo},
+        FeatureFlags,
+    };
+    use std::{
+        collections::HashMap,
+        sync::{atomic::AtomicBool, Arc},
+    };
+    use tokio::sync::{Mutex, RwLock};
+
+    fn test_state(features: FeatureFlags, generation: Generation) -> Arc<AppState> {
+        Arc::new(AppState {
+            cfg: AppConfig {
+                server_ip: "127.0.0.1".into(),
+                http_port: 1,
+                ws_port: 1,
+                gen: generation,
+                bind_port: 8888,
+                iface_name: "eth0".into(),
+            },
+            controller: RwLock::new(ControllerInfo {
+                board_mac: "001122334455".into(),
+                board_ip: "127.0.0.1".into(),
+                uid: None,
+            }),
+            usb_map: RwLock::new(HashMap::new()),
+            gen5_map: RwLock::new(HashMap::new()),
+            rtos_sessions: Mutex::new(HashMap::new()),
+            relay: RelayController::new(),
+            deletion_requested: AtomicBool::new(false),
+            client: reqwest::Client::new(),
+            jobs: Jobs::default(),
+            api_token: None,
+            hardware: HardwarePolicy { boards: Vec::new() },
+            features,
+            registration_done: AtomicBool::new(false),
+        })
+    }
+
+    async fn test_server(
+        features: FeatureFlags,
+        generation: Generation,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        test_server_with_token(features, generation, None).await
+    }
+
+    async fn test_server_with_token(
+        features: FeatureFlags,
+        generation: Generation,
+        api_token: Option<&str>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut state = test_state(features, generation);
+        Arc::get_mut(&mut state).unwrap().api_token = api_token.map(str::to_owned);
+        let app = router(state);
+        let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{address}"), handle)
+    }
 
     #[test]
     fn normalizes_supported_mac_formats() {
@@ -2299,5 +2359,209 @@ mod tests {
             extract_uboot_mac(b"other_ethaddr=aa:bb:cc:dd:ee:ff\r\n").unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn readiness_requires_registration_and_an_open_job_gate() {
+        assert_eq!(readiness_status(true, false), axum::http::StatusCode::OK);
+        assert_eq!(
+            readiness_status(false, false),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            readiness_status(true, true),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn gen3_feature_exposes_shared_ipl_without_enabling_gen5() {
+        let (base, server) = test_server(
+            FeatureFlags {
+                gen3: true,
+                ..FeatureFlags::default()
+            },
+            Generation::Gen3,
+        )
+        .await;
+        let response = reqwest::Client::new()
+            .post(format!("{base}/ipl"))
+            .json(&serde_json::json!({"gen": 3}))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert!(response.text().await.unwrap().contains("mac is required"));
+        assert!(crate::observability::metrics::global_metrics()
+            .render()
+            .contains(
+                "edgecontroller_hardware_operations_total{operation=\"ipl\",outcome=\"failure\"}"
+            ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn gen5_mapping_route_is_rejected_when_only_gen3_is_enabled() {
+        let (base, server) = test_server(
+            FeatureFlags {
+                gen3: true,
+                ..FeatureFlags::default()
+            },
+            Generation::Gen3,
+        )
+        .await;
+        let response = reqwest::Client::new()
+            .post(format!("{base}/mapping/entry"))
+            .json(&serde_json::json!({"gen": 5, "mac": "001122334455"}))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_IMPLEMENTED);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn unknown_paths_use_a_bounded_metrics_label() {
+        let (base, server) = test_server(FeatureFlags::default(), Generation::Gen4).await;
+        let unique_path = "/unknown-path-that-must-not-be-a-label";
+        let response = reqwest::get(format!("{base}{unique_path}")).await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+
+        let metrics = crate::observability::metrics::global_metrics().render();
+        assert!(metrics.contains("route=\"unmatched\""));
+        assert!(!metrics.contains(unique_path));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn bearer_authentication_rejects_missing_and_invalid_tokens() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let (base, server) =
+            test_server_with_token(FeatureFlags::default(), Generation::Gen4, Some(token)).await;
+        let client = reqwest::Client::new();
+
+        let missing = client.get(format!("{base}/health")).send().await.unwrap();
+        assert_eq!(missing.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        let invalid = client
+            .get(format!("{base}/health"))
+            .bearer_auth("wrong")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        let accepted = client
+            .get(format!("{base}/health"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), reqwest::StatusCode::OK);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn readiness_is_unavailable_before_backend_confirmation() {
+        let (base, server) = test_server(FeatureFlags::default(), Generation::Gen4).await;
+        let response = reqwest::get(format!("{base}/ready")).await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+
+        let payload = response.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(payload["ready"], false);
+        assert_eq!(payload["registered"], false);
+        assert_eq!(payload["shutting_down"], false);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn health_and_status_return_structured_operational_state_without_secrets() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let features = FeatureFlags {
+            gen4: true,
+            rtos: true,
+            ..FeatureFlags::default()
+        };
+        let (base, server) = test_server_with_token(features, Generation::Gen4, Some(token)).await;
+        let client = reqwest::Client::new();
+
+        let health = client
+            .get(format!("{base}/health"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            health.json::<serde_json::Value>().await.unwrap(),
+            serde_json::json!({"OK": true})
+        );
+
+        let status = client
+            .get(format!("{base}/status"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(status.status(), reqwest::StatusCode::OK);
+        let body = status.text().await.unwrap();
+        assert!(!body.contains(token));
+
+        let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(payload["status"], "ok");
+        assert_eq!(payload["generation"], 4);
+        assert_eq!(payload["registered"], false);
+        assert_eq!(payload["shutting_down"], false);
+        assert_eq!(payload["deletion_requested"], false);
+        assert_eq!(payload["usb_mapping_count"], 0);
+        assert_eq!(payload["gen5_mapping_count"], 0);
+        assert_eq!(payload["active_capture_count"], 0);
+        assert_eq!(payload["features"]["gen4"], true);
+        assert_eq!(payload["features"]["rtos"], true);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_returns_prometheus_exposition() {
+        let (base, server) = test_server(FeatureFlags::default(), Generation::Gen4).await;
+        let response = reqwest::get(format!("{base}/metrics")).await.unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            response.headers()[reqwest::header::CONTENT_TYPE],
+            crate::observability::metrics::PROMETHEUS_CONTENT_TYPE
+        );
+        assert!(response
+            .text()
+            .await
+            .unwrap()
+            .contains("# HELP edgecontroller_up"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn openapi_and_swagger_ui_are_accessible_with_correct_media_types() {
+        let (base, server) = test_server(FeatureFlags::default(), Generation::Gen4).await;
+
+        let contract = reqwest::get(format!("{base}/swagger.json")).await.unwrap();
+        assert_eq!(contract.status(), reqwest::StatusCode::OK);
+        assert!(contract.headers()[reqwest::header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("application/json"));
+        let document = contract.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(document["openapi"], "3.0.3");
+        assert!(document["paths"]["/health"]["get"].is_object());
+
+        let docs = reqwest::get(format!("{base}/docs")).await.unwrap();
+        assert_eq!(docs.status(), reqwest::StatusCode::OK);
+        assert!(docs.headers()[reqwest::header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/html"));
+        assert!(docs.text().await.unwrap().contains("url: '/swagger.json'"));
+        server.abort();
     }
 }

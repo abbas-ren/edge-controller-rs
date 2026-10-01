@@ -1,8 +1,11 @@
+//! Retained Linux GPIO output ownership for board boot-mode straps.
+
 use crate::error::{AppError, AppResult};
 use gpio_cdev::{Chip, LineHandle, LineRequestFlags};
 use std::sync::Mutex;
 
 /// Retaining the LineHandles retains ownership of the GPIO output lines.
+/// Pair of requested output lines retained until replacement or shutdown.
 pub struct RequestedLines {
     offsets: [u32; 2],
     handles: [LineHandle; 2],
@@ -10,6 +13,7 @@ pub struct RequestedLines {
 
 static LINES: Mutex<Option<RequestedLines>> = Mutex::new(None);
 
+/// Process-wide controller for the retained GPIO pair.
 pub struct GpioController;
 
 impl GpioController {
@@ -73,6 +77,7 @@ impl GpioController {
         Ok(())
     }
 
+    /// Release any retained GPIO line handles.
     pub fn stop() -> AppResult<()> {
         let mut lines = LINES
             .lock()
@@ -81,5 +86,22 @@ impl GpioController {
         *lines = None;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GpioController;
+
+    #[test]
+    fn duplicate_offsets_are_rejected_before_hardware_access() {
+        let error = GpioController::set_pair(7, 7, true).unwrap_err();
+        assert!(error.to_string().contains("must be different"));
+    }
+
+    #[test]
+    fn stopping_without_requested_lines_is_idempotent() {
+        GpioController::stop().unwrap();
+        GpioController::stop().unwrap();
     }
 }

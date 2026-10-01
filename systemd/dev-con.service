@@ -1,0 +1,30 @@
+[Unit]
+Description=Edge controller hardware service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+Environment="EDGE_CONTROLLER_ARGS=--enable-gen4"
+EnvironmentFile=-/etc/default/edgecontroller
+ExecStart=/usr/bin/edgecontroller $EDGE_CONTROLLER_ARGS
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=infinity
+KillSignal=SIGTERM
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+StateDirectory=dev-controller
+StateDirectoryMode=0750
+ReadWritePaths=/var/lib/dev-controller /var/log
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -20,18 +20,6 @@ use std::{
 };
 
 #[derive(Debug, Clone)]
-// Legacy helper kept to document the earlier mapping format. The runtime now
-// persists the same information in the board-specific map types, but this record
-// shape remains useful when comparing historical CSV layouts.
-#[allow(dead_code)]
-pub struct UsbMapEntry {
-    pub tty: String,
-    pub mac: String,
-    pub serial: String,
-    pub channel: u8,
-}
-
-#[derive(Debug, Clone)]
 pub struct Gen5MapEntry {
     pub uart: String,
     pub power: String,
@@ -125,7 +113,6 @@ pub struct UsbTty {
     /// This is intentionally kept even when the field is not used directly in the
     /// active runtime; it helps explain how a tty node was resolved during USB
     /// discovery and makes debugging hotplug problems much easier.
-    #[allow(dead_code)]
     pub topology: PathBuf,
 }
 
@@ -256,7 +243,10 @@ fn scan_at(class_tty: &Path, dev_root: &Path) -> AppResult<Vec<UsbTty>> {
     }
 
     devices.sort_unstable_by(|left, right| left.tty.cmp(&right.tty));
-    tracing::info!(scanned = devices.len(), "USB serial inventory scan completed");
+    tracing::info!(
+        scanned = devices.len(),
+        "USB serial inventory scan completed"
+    );
     Ok(devices)
 }
 
@@ -283,7 +273,10 @@ pub fn inventory() -> AppResult<Vec<UsbTty>> {
         }
     }
 
-    tracing::info!(device_count = devices.len(), "USB serial inventory collected");
+    tracing::info!(
+        device_count = devices.len(),
+        "USB serial inventory collected"
+    );
     Ok(devices)
 }
 

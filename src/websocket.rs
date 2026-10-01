@@ -6,7 +6,7 @@
 
 use crate::{
     error::{AppError, AppResult},
-    observability::metrics::MetricSampler,
+    observability::metrics::{global_metrics, MetricSampler},
     state::AppState,
 };
 
@@ -35,6 +35,14 @@ use tokio_tungstenite::{
 use tracing::{debug, info, warn};
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+struct ConnectionMetricGuard;
+
+impl Drop for ConnectionMetricGuard {
+    fn drop(&mut self) {
+        global_metrics().set_websocket_connected(false);
+    }
+}
 
 const SUBPROTOCOL: &str = "web-cli-protocol";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
@@ -113,6 +121,9 @@ async fn connection_session(
     }
 
     info!("WebSocket connected");
+    global_metrics().set_websocket_connected(true);
+    global_metrics().record_websocket_event("connected");
+    let _connection_metric = ConnectionMetricGuard;
 
     let start = Instant::now() + HEARTBEAT_INTERVAL;
     let mut heartbeat = time::interval_at(start, HEARTBEAT_INTERVAL);
@@ -128,8 +139,7 @@ async fn connection_session(
     loop {
         tokio::select! {
             _ = lifecycle.tick() => {
-                let shutting_down =
-                    state.jobs.is_closing() || *state.reboot.read().await;
+                let shutting_down = state.jobs.is_closing();
 
                 let current_uid = state.controller.read().await.uid.clone();
 
@@ -177,6 +187,7 @@ async fn connection_session(
                         let bytes = serde_json::to_vec(&payload)?;
                         debug!(bytes = bytes.len(), "sending heartbeat metrics payload");
                         send(&mut socket, Message::Binary(bytes.into())).await?;
+                        global_metrics().record_websocket_event("heartbeat_sent");
                     }
                     Err(error) => {
                         // Keep the transport alive, but do not send a
@@ -190,6 +201,7 @@ async fn connection_session(
                 match incoming {
                     Some(Ok(Message::Pong(data))) => {
                         last_pong = Instant::now();
+                        global_metrics().record_websocket_event("pong_received");
                         debug!(bytes = data.len(), "received WebSocket pong");
                     }
 
@@ -198,6 +210,7 @@ async fn connection_session(
                         // consider the socket healthy; simply flushing is not enough.
                         debug!(bytes = data.len(), "received WebSocket ping; replying with pong");
                         send(&mut socket, Message::Pong(data)).await?;
+                        global_metrics().record_websocket_event("ping_received");
                         last_pong = Instant::now();
                     }
 
@@ -207,6 +220,7 @@ async fn connection_session(
                             bytes = message.len(),
                             "received backend text message"
                         );
+                        global_metrics().record_websocket_event("text_received");
                     }
 
                     Some(Ok(Message::Binary(message))) => {
@@ -214,6 +228,7 @@ async fn connection_session(
                             bytes = message.len(),
                             "received backend binary message"
                         );
+                        global_metrics().record_websocket_event("binary_received");
                     }
 
                     Some(Ok(Message::Close(_))) => {
@@ -244,7 +259,7 @@ pub async fn websocket_loop(state: Arc<AppState>) {
     let mut retry_delay = Duration::from_secs(2);
 
     loop {
-        if state.jobs.is_closing() || *state.reboot.read().await {
+        if state.jobs.is_closing() {
             break;
         }
 
@@ -257,13 +272,19 @@ pub async fn websocket_loop(state: Arc<AppState>) {
 
         let started = Instant::now();
 
-        if let Err(error) = connection_session(&state, &uid, sampler.clone()).await {
-            warn!(%error, "WebSocket session ended");
-        }
+        let reconnect_event = match connection_session(&state, &uid, sampler.clone()).await {
+            Ok(()) => "reconnect_clean",
+            Err(error) => {
+                warn!(%error, "WebSocket session ended");
+                "reconnect_error"
+            }
+        };
 
-        if state.jobs.is_closing() || *state.reboot.read().await {
+        if state.jobs.is_closing() {
             break;
         }
+
+        global_metrics().record_websocket_event(reconnect_event);
 
         // Reset backoff after a reasonably stable connection. Repeated
         // immediate failures otherwise back off to at most one minute.
@@ -289,8 +310,17 @@ mod tests {
 
     #[test]
     fn reconnect_backoff_resets_after_a_stable_session() {
-        assert_eq!(next_retry_delay(Duration::from_secs(2), Duration::from_secs(31)), Duration::from_secs(2));
-        assert_eq!(next_retry_delay(Duration::from_secs(2), Duration::from_secs(10)), Duration::from_secs(4));
-        assert_eq!(next_retry_delay(Duration::from_secs(60), Duration::from_secs(10)), Duration::from_secs(60));
+        assert_eq!(
+            next_retry_delay(Duration::from_secs(2), Duration::from_secs(31)),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            next_retry_delay(Duration::from_secs(2), Duration::from_secs(10)),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            next_retry_delay(Duration::from_secs(60), Duration::from_secs(10)),
+            Duration::from_secs(60)
+        );
     }
 }

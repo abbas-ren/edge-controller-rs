@@ -8,13 +8,10 @@ use crate::{
     models::HeartbeatPayload,
 };
 
-use axum::{
-    response::IntoResponse,
-    routing::get,
-    Json, Router,
-};
+use axum::{response::IntoResponse, routing::get, Json, Router};
 use prometheus::{
-    Encoder, Gauge, HistogramOpts, HistogramVec, IntCounterVec, Opts, Registry, TextEncoder,
+    Encoder, Gauge, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+    Registry, TextEncoder,
 };
 use std::{
     fs,
@@ -26,6 +23,7 @@ use std::{
 use sysinfo::Disks;
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+pub const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
 #[derive(Default)]
 pub struct MetricSampler {
@@ -38,8 +36,15 @@ pub struct MetricsCollector {
     registry: Arc<Registry>,
     http_requests_total: IntCounterVec,
     http_request_duration_seconds: HistogramVec,
-    #[allow(dead_code)]
-    service_up: Gauge,
+    firmware_flash_total: IntCounterVec,
+    firmware_flash_duration_seconds: HistogramVec,
+    registration_attempts_total: IntCounterVec,
+    hardware_operations_total: IntCounterVec,
+    hardware_operation_active: IntGauge,
+    mapping_entries: IntGaugeVec,
+    active_captures: IntGauge,
+    websocket_connected: IntGauge,
+    websocket_events_total: IntCounterVec,
 }
 
 impl MetricsCollector {
@@ -61,8 +66,74 @@ impl MetricsCollector {
             &["method", "route"],
         )
         .expect("Request duration histogram must be valid");
-        let service_up = Gauge::new("edgecontroller_up", "Indicates whether the controller is serving traffic")
-            .expect("service status gauge must be valid");
+        let service_up = Gauge::new(
+            "edgecontroller_up",
+            "Indicates whether the controller is serving traffic",
+        )
+        .expect("service status gauge must be valid");
+        let firmware_flash_total = IntCounterVec::new(
+            Opts::new(
+                "edgecontroller_firmware_flash_total",
+                "Completed firmware flash operations by generation and outcome",
+            ),
+            &["generation", "outcome"],
+        )
+        .expect("Firmware flash counter must be valid");
+        let firmware_flash_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "edgecontroller_firmware_flash_duration_seconds",
+                "Firmware flash duration in seconds by generation",
+            ),
+            &["generation"],
+        )
+        .expect("Firmware flash duration histogram must be valid");
+        let websocket_connected = IntGauge::new(
+            "edgecontroller_websocket_connected",
+            "Whether the backend WebSocket session is currently connected",
+        )
+        .expect("WebSocket connection gauge must be valid");
+        let websocket_events_total = IntCounterVec::new(
+            Opts::new(
+                "edgecontroller_websocket_events_total",
+                "Backend WebSocket lifecycle and frame events by bounded event type",
+            ),
+            &["event"],
+        )
+        .expect("WebSocket event counter must be valid");
+        let registration_attempts_total = IntCounterVec::new(
+            Opts::new(
+                "edgecontroller_registration_attempts_total",
+                "Backend registration attempts by outcome",
+            ),
+            &["outcome"],
+        )
+        .expect("Registration attempt counter must be valid");
+        let hardware_operations_total = IntCounterVec::new(
+            Opts::new(
+                "edgecontroller_hardware_operations_total",
+                "Hardware API operations by bounded operation name and outcome",
+            ),
+            &["operation", "outcome"],
+        )
+        .expect("Hardware operation counter must be valid");
+        let hardware_operation_active = IntGauge::new(
+            "edgecontroller_hardware_operation_active",
+            "Whether one serialized hardware operation currently owns the lease",
+        )
+        .expect("Hardware operation gauge must be valid");
+        let mapping_entries = IntGaugeVec::new(
+            Opts::new(
+                "edgecontroller_mapping_entries",
+                "Persisted board mappings by mapping type",
+            ),
+            &["type"],
+        )
+        .expect("Mapping count gauge must be valid");
+        let active_captures = IntGauge::new(
+            "edgecontroller_active_captures",
+            "RTOS capture sessions retained by the controller",
+        )
+        .expect("Active capture gauge must be valid");
 
         registry
             .register(Box::new(http_requests_total.clone()))
@@ -73,6 +144,33 @@ impl MetricsCollector {
         registry
             .register(Box::new(service_up.clone()))
             .expect("service status gauge must be registered");
+        registry
+            .register(Box::new(firmware_flash_total.clone()))
+            .expect("Firmware flash counter must be registered");
+        registry
+            .register(Box::new(firmware_flash_duration_seconds.clone()))
+            .expect("Firmware flash duration histogram must be registered");
+        registry
+            .register(Box::new(websocket_connected.clone()))
+            .expect("WebSocket connection gauge must be registered");
+        registry
+            .register(Box::new(websocket_events_total.clone()))
+            .expect("WebSocket event counter must be registered");
+        registry
+            .register(Box::new(registration_attempts_total.clone()))
+            .expect("Registration attempt counter must be registered");
+        registry
+            .register(Box::new(hardware_operations_total.clone()))
+            .expect("Hardware operation counter must be registered");
+        registry
+            .register(Box::new(hardware_operation_active.clone()))
+            .expect("Hardware operation gauge must be registered");
+        registry
+            .register(Box::new(mapping_entries.clone()))
+            .expect("Mapping count gauge must be registered");
+        registry
+            .register(Box::new(active_captures.clone()))
+            .expect("Active capture gauge must be registered");
 
         service_up.set(1.0);
 
@@ -80,8 +178,82 @@ impl MetricsCollector {
             registry,
             http_requests_total,
             http_request_duration_seconds,
-            service_up,
+            firmware_flash_total,
+            firmware_flash_duration_seconds,
+            registration_attempts_total,
+            hardware_operations_total,
+            hardware_operation_active,
+            mapping_entries,
+            active_captures,
+            websocket_connected,
+            websocket_events_total,
         }
+    }
+
+    pub fn record_firmware_flash(&self, generation: u8, success: bool, duration_seconds: f64) {
+        let generation = generation.to_string();
+        let outcome = if success { "success" } else { "failure" };
+        self.firmware_flash_total
+            .with_label_values(&[&generation, outcome])
+            .inc();
+        self.firmware_flash_duration_seconds
+            .with_label_values(&[&generation])
+            .observe(duration_seconds);
+    }
+
+    pub fn set_websocket_connected(&self, connected: bool) {
+        self.websocket_connected.set(i64::from(connected));
+    }
+
+    pub fn record_websocket_event(&self, event: &'static str) {
+        debug_assert!(matches!(
+            event,
+            "connected"
+                | "reconnect_clean"
+                | "reconnect_error"
+                | "heartbeat_sent"
+                | "text_received"
+                | "binary_received"
+                | "ping_received"
+                | "pong_received"
+        ));
+        self.websocket_events_total
+            .with_label_values(&[event])
+            .inc();
+    }
+
+    pub fn record_registration_attempt(&self, outcome: &'static str) {
+        debug_assert!(matches!(
+            outcome,
+            "accepted" | "rejected" | "transport_error"
+        ));
+        self.registration_attempts_total
+            .with_label_values(&[outcome])
+            .inc();
+    }
+
+    pub fn record_hardware_operation(&self, operation: &str, success: bool) {
+        let outcome = if success { "success" } else { "failure" };
+        self.hardware_operations_total
+            .with_label_values(&[operation, outcome])
+            .inc();
+    }
+
+    pub fn set_hardware_operation_active(&self, active: bool) {
+        self.hardware_operation_active.set(i64::from(active));
+    }
+
+    pub fn set_mapping_counts(&self, usb: usize, gen5: usize) {
+        self.mapping_entries
+            .with_label_values(&["usb"])
+            .set(saturating_i64(usb));
+        self.mapping_entries
+            .with_label_values(&["gen5"])
+            .set(saturating_i64(gen5));
+    }
+
+    pub fn set_active_captures(&self, count: usize) {
+        self.active_captures.set(saturating_i64(count));
     }
 
     pub fn record_http_request(
@@ -110,6 +282,10 @@ impl MetricsCollector {
     }
 }
 
+fn saturating_i64(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
 pub fn global_metrics() -> &'static MetricsCollector {
     static GLOBAL: OnceLock<MetricsCollector> = OnceLock::new();
     GLOBAL.get_or_init(MetricsCollector::new)
@@ -117,7 +293,11 @@ pub fn global_metrics() -> &'static MetricsCollector {
 
 async fn metrics_handler() -> impl IntoResponse {
     let output = global_metrics().render();
-    (axum::http::StatusCode::OK, output)
+    (
+        axum::http::StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)],
+        output,
+    )
 }
 
 async fn health_handler() -> impl IntoResponse {
@@ -322,7 +502,9 @@ impl MetricSampler {
 
                 if elapsed > 0.0 {
                     (
-                        transmitted.saturating_sub(previous_tx) as f64 * 8.0 / elapsed / 1_000_000.0,
+                        transmitted.saturating_sub(previous_tx) as f64 * 8.0
+                            / elapsed
+                            / 1_000_000.0,
                         received.saturating_sub(previous_rx) as f64 * 8.0 / elapsed / 1_000_000.0,
                     )
                 } else {
@@ -382,5 +564,42 @@ mod tests {
         assert!(output.contains(
             "edgecontroller_http_request_duration_seconds_sum{method=\"GET\",route=\"/health\"} 0.025"
         ));
+    }
+
+    #[test]
+    fn operation_metrics_record_flash_and_websocket_state() {
+        let metrics = MetricsCollector::new();
+        metrics.record_firmware_flash(3, true, 12.5);
+        metrics.set_websocket_connected(true);
+        metrics.record_websocket_event("connected");
+        metrics.record_registration_attempt("rejected");
+        metrics.record_hardware_operation("relay", false);
+        metrics.set_hardware_operation_active(true);
+        metrics.set_mapping_counts(2, 3);
+        metrics.set_active_captures(4);
+
+        let output = metrics.render();
+        assert!(output.contains(
+            "edgecontroller_firmware_flash_total{generation=\"3\",outcome=\"success\"} 1"
+        ));
+        assert!(output
+            .contains("edgecontroller_firmware_flash_duration_seconds_sum{generation=\"3\"} 12.5"));
+        assert!(output.contains("edgecontroller_websocket_connected 1"));
+        assert!(output.contains("edgecontroller_websocket_events_total{event=\"connected\"} 1"));
+        assert!(
+            output.contains("edgecontroller_registration_attempts_total{outcome=\"rejected\"} 1")
+        );
+        assert!(output.contains(
+            "edgecontroller_hardware_operations_total{operation=\"relay\",outcome=\"failure\"} 1"
+        ));
+        assert!(output.contains("edgecontroller_hardware_operation_active 1"));
+        assert!(output.contains("edgecontroller_mapping_entries{type=\"usb\"} 2"));
+        assert!(output.contains("edgecontroller_mapping_entries{type=\"gen5\"} 3"));
+        assert!(output.contains("edgecontroller_active_captures 4"));
+
+        metrics.set_websocket_connected(false);
+        assert!(metrics
+            .render()
+            .contains("edgecontroller_websocket_connected 0"));
     }
 }

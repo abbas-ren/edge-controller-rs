@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Open an 8-N-1 serial console with bounded read timeouts.
 pub fn open_uart(path: &str, baud: u32) -> AppResult<Box<dyn SerialPort>> {
     serialport::new(path, baud)
         .data_bits(serialport::DataBits::Eight)
@@ -36,6 +37,7 @@ pub fn write_to_path(path: &str, text: &str) -> AppResult<()> {
     Ok(())
 }
 
+/// Buffered FlashWriter serial channel with bounded prompt matching.
 pub struct Console {
     port: Box<dyn SerialPort>,
     pending: Vec<u8>,
@@ -197,5 +199,25 @@ impl Console {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_to_path;
+    use std::fs;
+
+    #[test]
+    fn raw_write_preserves_protocol_bytes() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        write_to_path(file.path().to_str().unwrap(), "POWER#ON\n").unwrap();
+        assert_eq!(fs::read(file.path()).unwrap(), b"POWER#ON\n");
+    }
+
+    #[test]
+    fn raw_write_reports_missing_device() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing-device");
+        assert!(write_to_path(missing.to_str().unwrap(), "POWER#OFF\n").is_err());
     }
 }

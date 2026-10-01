@@ -1,3 +1,12 @@
+//! Edge controller service for board mapping, relay control, firmware flashing,
+//! RTOS capture, backend registration, and operational observability.
+//!
+//! The binary preserves the legacy controller protocols while applying
+//! validated persistence, serialized hardware admission, and graceful
+//! shutdown around those operations.
+
+#![deny(missing_docs)]
+
 mod cli;
 mod config;
 mod constants;
@@ -18,15 +27,11 @@ mod uart;
 mod usb;
 mod websocket;
 
-pub use cli::{Cli, FeatureFlags, USAGE};
+pub use cli::{Cli, FeatureFlags};
 
 use anyhow::{anyhow, Context, Result};
 use state::AppState;
-use std::{
-    net::SocketAddr,
-    sync::atomic::Ordering,
-    time::Duration,
-};
+use std::{net::SocketAddr, sync::atomic::Ordering, time::Duration};
 use tracing::{info, warn};
 
 #[tokio::main]
@@ -42,39 +47,52 @@ async fn main() -> Result<()> {
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .context("installing SIGINT handler")?;
 
-    // Optional first argument overrides the legacy configuration pathname.
-    let cli = Cli::parse(std::env::args_os())?;
+    let cli = Cli::parse(std::env::args_os().skip(1))?;
 
-    let (config_path, check_only, log_level, log_file, log_network, log_stream, metrics_port, bind_port, features) =
-        match cli {
-            Cli::Help => {
-                print!("{USAGE}");
-                return Ok(());
-            }
-            Cli::Start {
-                config_path,
-                check_only,
-                log_level,
-                log_file,
-                log_network,
-                log_stream,
-                metrics_port,
-                bind_port,
-                features,
-            } => (
-                config_path,
-                check_only,
-                log_level,
-                log_file,
-                log_network,
-                log_stream,
-                metrics_port,
-                bind_port,
-                features,
-            ),
-        };
+    let (
+        config_path,
+        check_only,
+        log_level,
+        log_file,
+        log_network,
+        log_stream,
+        metrics_port,
+        bind_port,
+        features,
+    ) = match cli {
+        Cli::Help => {
+            print!("{}", Cli::help_text()?);
+            return Ok(());
+        }
+        Cli::Start {
+            config_path,
+            check_only,
+            log_level,
+            log_file,
+            log_network,
+            log_stream,
+            metrics_port,
+            bind_port,
+            features,
+        } => (
+            config_path,
+            check_only,
+            log_level,
+            log_file,
+            log_network,
+            log_stream,
+            metrics_port,
+            bind_port,
+            features,
+        ),
+    };
 
-    logging::init_logging(log_level.as_deref(), log_file.as_deref(), log_network, log_stream);
+    logging::init_logging(
+        log_level.as_deref(),
+        log_file.as_deref(),
+        log_network,
+        log_stream,
+    )?;
 
     info!(
         config_path = %config_path,
@@ -110,9 +128,8 @@ async fn main() -> Result<()> {
     cfg.validate()
         .context("validating configuration overrides")?;
 
-    // Default to localhost because the existing HTTP router has no
-    // authentication. Override explicitly when deploying behind an
-    // authenticated proxy or on an appropriately restricted network.
+    // Preserve the legacy all-interface listener. Deployments should configure
+    // a bearer token or restrict access at the network boundary.
     let bind_value = match std::env::var("DEV_CONTROLLER_BIND") {
         Ok(value) => {
             info!(bind = %value, "DEV_CONTROLLER_BIND override applied");
@@ -136,13 +153,13 @@ async fn main() -> Result<()> {
         ));
     }
 
-    // if !bind_address.ip().is_loopback() {
-    //     warn!(
-    //         %bind_address,
-    //         "HTTP hardware-control API is exposed without built-in authentication"
-    //     );
-    // }
     let api_token = config::configured_api_token()?;
+    if !bind_address.ip().is_loopback() && api_token.is_none() {
+        warn!(
+            %bind_address,
+            "HTTP hardware-control API is exposed without bearer authentication"
+        );
+    }
     let hardware_path = config::configured_hardware_path()?;
     // This branch must precede signal installation, interface discovery,
     // AppState construction, USB inventory, and server startup.
@@ -174,12 +191,6 @@ async fn main() -> Result<()> {
         .await
         .context("initializing controller state")?;
 
-    // if !bind_address.ip().is_loopback() && state.api_token.is_none() {
-    //     return Err(anyhow!(
-    //         "DEV_CONTROLLER_TOKEN is required when listening beyond loopback"
-    //     ));
-    // }
-
     // Bind before registration so the backend can reach /confirmation
     // immediately after receiving the registration request.
     let listener = tokio::net::TcpListener::bind(bind_address)
@@ -201,9 +212,8 @@ async fn main() -> Result<()> {
         .await
         .context("relay inventory worker failed")?;
 
-    // The registration is intentionally a single message after the listener is
-    // bound and ready. This gives the backend a chance to establish any
-    // callback or reverse connection using the payload we send.
+    // Registration begins only after the callback listener is ready and keeps
+    // retrying transient backend failures until accepted or shutdown.
     let registration_task = tokio::spawn(runtime::registration_loop(state.clone(), inventory));
     let websocket_task = tokio::spawn(websocket::websocket_loop(state.clone()));
 
@@ -212,7 +222,7 @@ async fn main() -> Result<()> {
     let shutdown = async move {
         let deletion_requested = async {
             loop {
-                if *shutdown_state.reboot.read().await {
+                if shutdown_state.deletion_requested() {
                     break;
                 }
 
@@ -233,10 +243,6 @@ async fn main() -> Result<()> {
         }
         shutdown_state.jobs.begin_shutdown();
 
-        // This flag means stop the controller service. It does not reboot
-        // Linux or power-cycle any connected board.
-        *shutdown_state.reboot.write().await = true;
-
         // Request capture termination promptly, even while HTTP requests
         // are still draining.
         let sessions = shutdown_state.rtos_sessions.lock().await;
@@ -250,7 +256,6 @@ async fn main() -> Result<()> {
         .await;
     // Covers both requested shutdown and an unexpected HTTP server failure.
     state.jobs.begin_shutdown();
-    *state.reboot.write().await = true;
 
     // Accepted hardware requests and their child IPL jobs must finish before
     // capture cleanup or GPIO release.
@@ -259,9 +264,6 @@ async fn main() -> Result<()> {
     // the external Gen5 flashing protocol has not been specified.
     info!("waiting for accepted hardware operations to finish");
     state.jobs.wait().await;
-
-    // Also perform cleanup if the HTTP server exits with an error.
-    *state.reboot.write().await = true;
 
     // The earlier WebSocket loop does not inspect the shutdown flag while
     // connected. Abort its async task to drop the connection promptly.

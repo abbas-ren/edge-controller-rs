@@ -109,7 +109,10 @@ pub fn read_required_text(path: &Path, limit: usize) -> AppResult<String> {
         }
         None => {
             tracing::error!(path = %path.display(), limit, "required file missing; failing startup");
-            Err(invalid(format!("required file is missing: {}", path.display())))
+            Err(invalid(format!(
+                "required file is missing: {}",
+                path.display()
+            )))
         }
     }
 }
@@ -366,13 +369,10 @@ pub fn validate_snapshot(
                 invalid("persisted USB mapping references an unapproved board")
             })?;
 
-        let relay = board
-            .relay
-            .as_ref()
-            .ok_or_else(|| {
-                tracing::warn!(mac = %mac, "approved board is missing a relay binding");
-                invalid("approved board lacks a relay binding")
-            })?;
+        let relay = board.relay.as_ref().ok_or_else(|| {
+            tracing::warn!(mac = %mac, "approved board is missing a relay binding");
+            invalid("approved board lacks a relay binding")
+        })?;
 
         if relay.serial != *serial || relay.channel != *channel {
             tracing::warn!(
@@ -409,7 +409,11 @@ pub fn validate_snapshot(
         }
     }
 
-    tracing::info!(usb_count = parsed_usb.len(), gen5_count = parsed_gen5.len(), "persisted mapping snapshot validated");
+    tracing::info!(
+        usb_count = parsed_usb.len(),
+        gen5_count = parsed_gen5.len(),
+        "persisted mapping snapshot validated"
+    );
     Ok(())
 }
 
@@ -436,11 +440,10 @@ pub fn load_mappings(
         "loading persisted mappings and validating them"
     );
 
-    let usb = parse_usb(&usb_text)
-        .map_err(|error| {
-            tracing::error!(path = %usb_path.display(), error = %error, "USB mapping file is invalid");
-            invalid(format!("invalid {}: {error}", usb_path.display()))
-        })?;
+    let usb = parse_usb(&usb_text).map_err(|error| {
+        tracing::error!(path = %usb_path.display(), error = %error, "USB mapping file is invalid");
+        invalid(format!("invalid {}: {error}", usb_path.display()))
+    })?;
 
     let gen5 = parse_gen5(&gen5_text)
         .map_err(|error| {
@@ -450,7 +453,11 @@ pub fn load_mappings(
 
     validate_snapshot(&usb, &gen5, policy)?;
 
-    tracing::info!(usb_mappings = usb.len(), gen5_mappings = gen5.len(), "persisted mappings loaded and verified");
+    tracing::info!(
+        usb_mappings = usb.len(),
+        gen5_mappings = gen5.len(),
+        "persisted mappings loaded and verified"
+    );
     Ok((usb, gen5))
 }
 

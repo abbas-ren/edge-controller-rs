@@ -14,32 +14,13 @@ use crate::{
 };
 
 use serde::Serialize;
-use std::{collections::BTreeMap, fs, net::Ipv4Addr, path::Path};
+use std::{collections::BTreeMap, net::Ipv4Addr, path::Path};
 
-#[allow(dead_code)]
 pub const UID_FILE: &str = "/var/log/uid";
-#[allow(dead_code)]
 pub const GEN5_POWER_TTY: &str = "/var/log/gen5_power.csv";
-#[allow(dead_code)]
 pub const GEN5_UART_TTY: &str = "/var/log/gen5_uart.csv";
-#[allow(dead_code)]
 pub const USB_MAPPING_FILE: &str = "/var/log/usb_mapping.csv";
-#[allow(dead_code)]
 pub const GEN5_MAPPING_FILE: &str = "/var/log/gen5_mapping.csv";
-// These paths are retained for compatibility with the legacy controller layout,
-// even though the active runtime currently persists state through the dedicated
-// mapping and UID files above. Keeping them here documents the original storage
-// contract and avoids silently inventing a different filesystem layout.
-#[allow(dead_code)]
-pub const TEMP_FILE_PATH: &str = "/var/log/temp.csv";
-#[allow(dead_code)]
-pub const LOG_PATH: &str = "/var/log/dev-controller.log";
-#[allow(dead_code)]
-pub const LOGIN_PATH: &str = "/etc/config/login.cfg";
-#[allow(dead_code)]
-pub const GEN5_IPL_LOG_PREFIX: &str = "/var/log/gen5-ipl";
-#[allow(dead_code)]
-pub const GEN4_IPL_LOG_PREFIX: &str = "/var/log/gen4-ipl";
 
 const MAX_CONFIG_BYTES: usize = 16 * 1024;
 
@@ -211,17 +192,6 @@ impl AppConfig {
 
         validate_interface(&self.iface_name)
     }
-
-    #[allow(dead_code)]
-    pub fn ensure_parent(path: &str) -> AppResult<()> {
-        // Some generated or restored configuration paths may be relative to a
-        // parent directory that is not yet present; create it in-place so the app
-        // can recover from a first-boot filesystem state.
-        if let Some(parent) = Path::new(path).parent() {
-            fs::create_dir_all(parent)?;
-        }
-        Ok(())
-    }
 }
 
 /// Read an optional environment variable without treating invalid UTF-8
@@ -229,11 +199,18 @@ impl AppConfig {
 pub fn optional_environment(name: &str) -> AppResult<Option<String>> {
     match std::env::var(name) {
         Ok(value) => {
-            tracing::debug!(variable = name, value_length = value.len(), "environment variable set; using explicit override");
+            tracing::debug!(
+                variable = name,
+                value_length = value.len(),
+                "environment variable set; using explicit override"
+            );
             Ok(Some(value))
         }
         Err(std::env::VarError::NotPresent) => {
-            tracing::debug!(variable = name, "environment variable not set; falling back to default behavior");
+            tracing::debug!(
+                variable = name,
+                "environment variable not set; falling back to default behavior"
+            );
             Ok(None)
         }
         Err(std::env::VarError::NotUnicode(_)) => {
@@ -258,14 +235,13 @@ pub fn configured_api_token() -> AppResult<Option<String>> {
 }
 
 pub fn configured_hardware_path() -> AppResult<String> {
-    let path = optional_environment("DEV_CONTROLLER_HARDWARE")?
-        .unwrap_or_else(|| {
-            tracing::info!(
-                default_path = "/etc/dev-controller/hardware.json",
-                "DEV_CONTROLLER_HARDWARE unset; using default hardware policy path"
-            );
-            "/etc/dev-controller/hardware.json".into()
-        });
+    let path = optional_environment("DEV_CONTROLLER_HARDWARE")?.unwrap_or_else(|| {
+        tracing::info!(
+            default_path = "/etc/dev-controller/hardware.json",
+            "DEV_CONTROLLER_HARDWARE unset; using default hardware policy path"
+        );
+        "/etc/dev-controller/hardware.json".into()
+    });
 
     if !Path::new(&path).is_absolute() {
         tracing::error!(

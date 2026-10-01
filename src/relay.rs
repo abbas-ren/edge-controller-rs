@@ -213,7 +213,11 @@ impl RelayController {
             on,
             "relay command transferred"
         );
-        tracing::debug!(previous_state = current, updated_state = updated, "relay bitmask updated");
+        tracing::debug!(
+            previous_state = current,
+            updated_state = updated,
+            "relay bitmask updated"
+        );
 
         // This confirms the USB transfer, not mechanical contact closure.
         Ok(())

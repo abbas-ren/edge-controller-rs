@@ -4,6 +4,7 @@ use crate::{
     hardware::HardwarePolicy,
     jobs::Jobs,
     models::{RegistrationPayload, RelayInventory},
+    observability::metrics::global_metrics,
     relay::RelayController,
     store::{self, Gen5Mappings, UsbMappings},
     FeatureFlags,
@@ -43,7 +44,7 @@ pub struct AppState {
     pub gen5_map: RwLock<Gen5Mappings>,
     pub rtos_sessions: Mutex<HashMap<String, RtosSession>>,
     pub relay: RelayController,
-    pub reboot: RwLock<bool>,
+    pub(crate) deletion_requested: AtomicBool,
     pub client: reqwest::Client,
     pub jobs: Jobs,
     pub api_token: Option<String>,
@@ -72,7 +73,10 @@ impl AppState {
         if api_token.as_ref().is_some_and(|token| {
             !(32..=256).contains(&token.len()) || !token.bytes().all(|byte| byte.is_ascii_graphic())
         }) {
-            tracing::error!(token_length = api_token.as_ref().map_or(0, |token| token.len()), "invalid DEV_CONTROLLER_TOKEN rejected");
+            tracing::error!(
+                token_length = api_token.as_ref().map_or(0, |token| token.len()),
+                "invalid DEV_CONTROLLER_TOKEN rejected"
+            );
             return Err(AppError::Msg(
                 "DEV_CONTROLLER_TOKEN must be 32..256 visible ASCII characters".into(),
             ));
@@ -143,7 +147,7 @@ impl AppState {
             gen5_map: RwLock::new(gen5_map),
             rtos_sessions: Mutex::new(HashMap::new()),
             relay: RelayController::new(),
-            reboot: RwLock::new(false),
+            deletion_requested: AtomicBool::new(false),
             client,
             jobs: Jobs::default(),
             api_token,
@@ -151,6 +155,11 @@ impl AppState {
             features,
             registration_done: AtomicBool::new(false),
         });
+
+        global_metrics().set_mapping_counts(
+            state.usb_map.read().await.len(),
+            state.gen5_map.read().await.len(),
+        );
 
         let controller_uid = state.controller.read().await.uid.clone();
 
@@ -213,25 +222,25 @@ impl AppState {
     pub fn try_begin_registration(&self) -> bool {
         !self.registration_done.swap(true, Ordering::AcqRel)
     }
-}
 
-/// Legacy normalization helper, retained for existing internal callers.
-///
-/// External values should use store::checked_mac instead. Keeping this helper in
-/// the state module documents the earlier normalization contract while avoiding
-/// new call sites that might reintroduce inconsistent MAC parsing.
-#[allow(dead_code)]
-pub fn normalize_mac(value: &str) -> String {
-    value
-        .to_ascii_lowercase()
-        .chars()
-        .filter(|character| !matches!(character, ':' | '-' | ' '))
-        .collect()
+    pub fn request_deletion(&self) {
+        self.deletion_requested.store(true, Ordering::Release);
+    }
+
+    pub fn deletion_requested(&self) -> bool {
+        self.deletion_requested.load(Ordering::Acquire)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicBool;
+    use super::{AppState, ControllerInfo};
+    use crate::{
+        config::AppConfig, hardware::HardwarePolicy, jobs::Jobs, models::Generation,
+        relay::RelayController, FeatureFlags,
+    };
+    use std::{collections::HashMap, sync::atomic::AtomicBool};
+    use tokio::sync::{Mutex, RwLock};
 
     #[test]
     fn registration_guard_only_allows_one_transition() {
@@ -253,5 +262,40 @@ mod tests {
             std::sync::atomic::Ordering::Acquire,
         )
         .is_ok());
+    }
+
+    #[test]
+    fn deletion_signal_does_not_begin_service_shutdown() {
+        let state = AppState {
+            cfg: AppConfig {
+                server_ip: "127.0.0.1".into(),
+                http_port: 1,
+                ws_port: 1,
+                gen: Generation::Gen4,
+                bind_port: 8888,
+                iface_name: "eth0".into(),
+            },
+            controller: RwLock::new(ControllerInfo {
+                board_mac: "001122334455".into(),
+                board_ip: "127.0.0.1".into(),
+                uid: None,
+            }),
+            usb_map: RwLock::new(HashMap::new()),
+            gen5_map: RwLock::new(HashMap::new()),
+            rtos_sessions: Mutex::new(HashMap::new()),
+            relay: RelayController::new(),
+            deletion_requested: AtomicBool::new(false),
+            client: reqwest::Client::new(),
+            jobs: Jobs::default(),
+            api_token: None,
+            hardware: HardwarePolicy { boards: Vec::new() },
+            features: FeatureFlags::default(),
+            registration_done: AtomicBool::new(false),
+        };
+
+        state.request_deletion();
+
+        assert!(state.deletion_requested());
+        assert!(!state.jobs.is_closing());
     }
 }
