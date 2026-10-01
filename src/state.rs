@@ -56,12 +56,14 @@ impl AppState {
         if api_token.as_ref().is_some_and(|token| {
             !(32..=256).contains(&token.len()) || !token.bytes().all(|byte| byte.is_ascii_graphic())
         }) {
+            tracing::error!(token_length = api_token.as_ref().map_or(0, |token| token.len()), "invalid DEV_CONTROLLER_TOKEN rejected");
             return Err(AppError::Msg(
                 "DEV_CONTROLLER_TOKEN must be 32..256 visible ASCII characters".into(),
             ));
         }
 
         if !Path::new(&hardware_path).is_absolute() {
+            tracing::error!(hardware_path = %hardware_path, "invalid hardware policy path rejected");
             return Err(AppError::Msg(
                 "DEV_CONTROLLER_HARDWARE must be an absolute pathname".into(),
             ));
@@ -71,6 +73,11 @@ impl AppState {
             tracing::info!(hardware_path = %hardware_path, "loading hardware policy and persisted state");
 
             let hardware = HardwarePolicy::load(&hardware_path)?;
+            tracing::info!(
+                board_count = hardware.boards.len(),
+                hardware_path = %hardware_path,
+                "hardware policy loaded and validated"
+            );
 
             let (usb_map, gen5_map) = store::load_mappings(
                 Path::new(USB_MAPPING_FILE),
@@ -86,6 +93,14 @@ impl AppState {
                 saved_uid_present = uid.is_some(),
                 "persisted controller state loaded"
             );
+
+            if usb_map.is_empty() && gen5_map.is_empty() {
+                tracing::info!(
+                    usb_mapping_path = %USB_MAPPING_FILE,
+                    gen5_mapping_path = %GEN5_MAPPING_FILE,
+                    "mapping files are empty or absent; starting from an empty persisted state"
+                );
+            }
 
             Ok::<_, AppError>((hardware, usb_map, gen5_map, uid))
         })

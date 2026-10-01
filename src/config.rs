@@ -222,9 +222,16 @@ impl AppConfig {
 /// as if the variable were absent.
 pub fn optional_environment(name: &str) -> AppResult<Option<String>> {
     match std::env::var(name) {
-        Ok(value) => Ok(Some(value)),
-        Err(std::env::VarError::NotPresent) => Ok(None),
+        Ok(value) => {
+            tracing::debug!(variable = name, value_length = value.len(), "environment variable set; using explicit override");
+            Ok(Some(value))
+        }
+        Err(std::env::VarError::NotPresent) => {
+            tracing::debug!(variable = name, "environment variable not set; falling back to default behavior");
+            Ok(None)
+        }
         Err(std::env::VarError::NotUnicode(_)) => {
+            tracing::error!(variable = name, "environment variable is not valid UTF-8");
             Err(AppError::Msg(format!("{name} must be valid UTF-8")))
         }
     }
@@ -246,14 +253,25 @@ pub fn configured_api_token() -> AppResult<Option<String>> {
 
 pub fn configured_hardware_path() -> AppResult<String> {
     let path = optional_environment("DEV_CONTROLLER_HARDWARE")?
-        .unwrap_or_else(|| "/etc/dev-controller/hardware.json".into());
+        .unwrap_or_else(|| {
+            tracing::info!(
+                default_path = "/etc/dev-controller/hardware.json",
+                "DEV_CONTROLLER_HARDWARE unset; using default hardware policy path"
+            );
+            "/etc/dev-controller/hardware.json".into()
+        });
 
     if !Path::new(&path).is_absolute() {
+        tracing::error!(
+            configured_path = %path,
+            "DEV_CONTROLLER_HARDWARE is not absolute; rejecting invalid path"
+        );
         return Err(AppError::Msg(
             "DEV_CONTROLLER_HARDWARE must be an absolute pathname".into(),
         ));
     }
 
+    tracing::info!(hardware_path = %path, "hardware policy path selected");
     Ok(path)
 }
 

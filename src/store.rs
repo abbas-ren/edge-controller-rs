@@ -65,7 +65,11 @@ fn open_regular(path: &Path) -> AppResult<Option<File>> {
 
 pub fn read_optional_text(path: &Path, limit: usize) -> AppResult<Option<String>> {
     let Some(file) = open_regular(path)? else {
-        tracing::debug!(path = %path.display(), "state file absent; treat as empty/default mapping state");
+        tracing::debug!(
+            path = %path.display(),
+            limit,
+            "state file absent; treating it as empty/default mapping state"
+        );
         return Ok(None);
     };
 
@@ -73,6 +77,12 @@ pub fn read_optional_text(path: &Path, limit: usize) -> AppResult<Option<String>
     file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
 
     if bytes.len() > limit {
+        tracing::error!(
+            path = %path.display(),
+            limit,
+            actual_size = bytes.len(),
+            "state file exceeds configured size limit"
+        );
         return Err(invalid(format!(
             "{} exceeds its {}-byte limit",
             path.display(),
@@ -83,13 +93,25 @@ pub fn read_optional_text(path: &Path, limit: usize) -> AppResult<Option<String>
     let text = String::from_utf8(bytes)
         .map_err(|_| invalid(format!("{} is not valid UTF-8", path.display())))?;
 
-    tracing::debug!(path = %path.display(), bytes = text.len(), "state file read successfully");
+    tracing::debug!(
+        path = %path.display(),
+        bytes = text.len(),
+        "state file read successfully"
+    );
     Ok(Some(text))
 }
 
 pub fn read_required_text(path: &Path, limit: usize) -> AppResult<String> {
-    read_optional_text(path, limit)?
-        .ok_or_else(|| invalid(format!("required file is missing: {}", path.display())))
+    match read_optional_text(path, limit)? {
+        Some(text) => {
+            tracing::debug!(path = %path.display(), bytes = text.len(), "required configuration file loaded");
+            Ok(text)
+        }
+        None => {
+            tracing::error!(path = %path.display(), limit, "required file missing; failing startup");
+            Err(invalid(format!("required file is missing: {}", path.display())))
+        }
+    }
 }
 
 /// Accept exactly:
@@ -398,6 +420,13 @@ pub fn load_mappings(
 ) -> AppResult<(UsbMappings, Gen5Mappings)> {
     let usb_text = read_optional_text(usb_path, MAX_STATE_BYTES)?.unwrap_or_default();
     let gen5_text = read_optional_text(gen5_path, MAX_STATE_BYTES)?.unwrap_or_default();
+
+    if usb_text.is_empty() {
+        tracing::info!(path = %usb_path.display(), "USB mapping file absent or empty; using empty persisted USB mapping state");
+    }
+    if gen5_text.is_empty() {
+        tracing::info!(path = %gen5_path.display(), "Gen5 mapping file absent or empty; using empty persisted Gen5 mapping state");
+    }
 
     tracing::debug!(
         usb_path = %usb_path.display(),
