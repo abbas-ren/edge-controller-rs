@@ -75,6 +75,16 @@ impl HardwarePolicy {
                 .into_iter()
                 .flatten()
             {
+                tracing::debug!(
+                    mac = %board.mac,
+                    generation = board.gen,
+                    vid = identity.vid,
+                    pid = identity.pid,
+                    serial = %identity.serial,
+                    interface = identity.interface,
+                    "validating USB identity against the hardware policy"
+                );
+
                 identity.validate()?;
 
                 if usb::is_relay_identity(identity) {

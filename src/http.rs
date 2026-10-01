@@ -467,13 +467,35 @@ fn map_usb_to_mac_sync(
 
     let _operation = mapping_guard()?;
 
+    tracing::info!(
+        mac = %mac,
+        serial = %serial,
+        channel,
+        generation = ?generation,
+        "beginning verified UART mapping for board"
+    );
+
     let binding = state.hardware.board(&mac, generation.as_int())?;
     let relay = binding
         .relay
         .as_ref()
         .ok_or_else(|| AppError::Msg("approved relay binding missing".into()))?;
 
+    tracing::debug!(
+        mac = %mac,
+        approved_uart = ?binding.uart,
+        approved_relay = ?relay,
+        "approved board wiring loaded from hardware policy"
+    );
+
     if relay.serial != serial || relay.channel != channel {
+        tracing::warn!(
+            requested_serial = %serial,
+            requested_channel = channel,
+            approved_serial = %relay.serial,
+            approved_channel = relay.channel,
+            "requested relay/channel differs from approved wiring"
+        );
         return Err(AppError::Msg(
             "requested relay/channel differs from approved wiring".into(),
         ));
@@ -481,11 +503,25 @@ fn map_usb_to_mac_sync(
 
     let tty = crate::usb::resolve_identity(&binding.uart)?;
 
+    tracing::info!(
+        mac = %mac,
+        tty = %tty,
+        uart_identity = ?binding.uart,
+        "resolved approved UART to the live ttyUSB node"
+    );
+
     // Do not accept an old ttyUSB pathname as a verified cache hit.
     let port = open_uart(&tty, baud)?;
     let observed = probe_with_power(port, Duration::from_secs(3), |on| {
         state.relay.set_channel(&serial, channel, on)
     })?;
+
+    tracing::debug!(
+        mac = %mac,
+        tty = %tty,
+        observed = ?observed,
+        "board probe completed; checking whether the observed MAC matches the requested one"
+    );
 
     if observed.as_deref() != Some(mac.as_str()) {
         tracing::warn!(

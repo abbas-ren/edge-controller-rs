@@ -251,6 +251,26 @@ pub fn inventory() -> AppResult<Vec<UsbTty>> {
 fn select_identity(devices: &[UsbTty], identity: &UsbIdentity) -> AppResult<String> {
     identity.validate()?;
 
+    let available = devices
+        .iter()
+        .map(|device| {
+            format!(
+                "tty={} vid={:04x} pid={:04x} serial={:?} interface={}",
+                device.tty, device.vid, device.pid, device.serial, device.interface
+            )
+        })
+        .collect::<Vec<_>>();
+
+    tracing::debug!(
+        requested_vid = identity.vid,
+        requested_pid = identity.pid,
+        requested_serial = %identity.serial,
+        requested_interface = identity.interface,
+        device_count = devices.len(),
+        available_devices = ?available,
+        "checking live USB inventory against the requested USB identity"
+    );
+
     let mut matches = devices.iter().filter(|device| identity.matches(device));
 
     let first = matches.next().ok_or_else(|| {
@@ -259,11 +279,12 @@ fn select_identity(devices: &[UsbTty], identity: &UsbIdentity) -> AppResult<Stri
             pid = identity.pid,
             serial = %identity.serial,
             interface = identity.interface,
+            available_devices = ?available,
             "requested USB identity is unavailable"
         );
         AppError::Msg(format!(
-            "USB device {:04x}:{:04x}, serial {:?}, interface {} unavailable",
-            identity.vid, identity.pid, identity.serial, identity.interface
+            "USB device {:04x}:{:04x}, serial {:?}, interface {} unavailable; available: {:?}",
+            identity.vid, identity.pid, identity.serial, identity.interface, available
         ))
     })?;
 
@@ -273,6 +294,7 @@ fn select_identity(devices: &[UsbTty], identity: &UsbIdentity) -> AppResult<Stri
             pid = identity.pid,
             serial = %identity.serial,
             interface = identity.interface,
+            available_devices = ?available,
             "USB identity is ambiguous; refusing to select a device"
         );
         return Err(AppError::Msg(
@@ -286,20 +308,25 @@ fn select_identity(devices: &[UsbTty], identity: &UsbIdentity) -> AppResult<Stri
         pid = identity.pid,
         serial = %identity.serial,
         interface = identity.interface,
+        topology = %first.topology.display(),
         "USB identity resolved to a live TTY"
     );
     Ok(first.tty.clone())
 }
 
 pub fn resolve_identity(identity: &UsbIdentity) -> AppResult<String> {
+    let inventory = inventory()?;
+
     tracing::debug!(
         vid = identity.vid,
         pid = identity.pid,
         serial = %identity.serial,
         interface = identity.interface,
+        scanned_ttys = inventory.len(),
         "resolving USB identity to a device node"
     );
-    select_identity(&inventory()?, identity)
+
+    select_identity(&inventory, identity)
 }
 
 pub fn is_relay_identity(identity: &UsbIdentity) -> bool {
