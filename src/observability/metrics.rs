@@ -1,15 +1,28 @@
 //! Linux system metrics for the legacy heartbeat schema.
 //!
-//! Call heartbeat() from a blocking worker: procfs, sysfs, and filesystem
-//! statistics are synchronous operations.
+//! The original sampler is kept for WebSocket heartbeat reporting. The module
+//! also exposes a Prometheus registry for Grafana-friendly endpoint monitoring.
 
 use crate::{
     error::{AppError, AppResult},
     models::HeartbeatPayload,
 };
 
-use std::{fs, path::Path, time::Instant};
-
+use axum::{
+    response::IntoResponse,
+    routing::get,
+    Json, Router,
+};
+use prometheus::{
+    Encoder, Gauge, HistogramOpts, HistogramVec, IntCounterVec, Opts, Registry, TextEncoder,
+};
+use std::{
+    fs,
+    net::SocketAddr,
+    path::Path,
+    sync::{Arc, OnceLock},
+    time::Instant,
+};
 use sysinfo::Disks;
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -18,6 +31,114 @@ const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 pub struct MetricSampler {
     previous_cpu: Option<(u64, u64)>,
     previous_network: Option<(Instant, u64, u64)>,
+}
+
+#[derive(Clone)]
+pub struct MetricsCollector {
+    registry: Arc<Registry>,
+    http_requests_total: IntCounterVec,
+    http_request_duration_seconds: HistogramVec,
+    #[allow(dead_code)]
+    service_up: Gauge,
+}
+
+impl MetricsCollector {
+    pub fn new() -> Self {
+        let registry = Arc::new(Registry::new());
+        let http_requests_total = IntCounterVec::new(
+            Opts::new(
+                "edgecontroller_http_requests_total",
+                "Total number of HTTP requests handled by the controller",
+            ),
+            &["method", "route", "status"],
+        )
+        .expect("HTTP request counter must be valid");
+        let http_request_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "edgecontroller_http_request_duration_seconds",
+                "Duration of HTTP requests in seconds",
+            ),
+            &["method", "route"],
+        )
+        .expect("Request duration histogram must be valid");
+        let service_up = Gauge::new("edgecontroller_up", "Indicates whether the controller is serving traffic")
+            .expect("service status gauge must be valid");
+
+        registry
+            .register(Box::new(http_requests_total.clone()))
+            .expect("HTTP request counter must be registered");
+        registry
+            .register(Box::new(http_request_duration_seconds.clone()))
+            .expect("HTTP request duration histogram must be registered");
+        registry
+            .register(Box::new(service_up.clone()))
+            .expect("service status gauge must be registered");
+
+        service_up.set(1.0);
+
+        Self {
+            registry,
+            http_requests_total,
+            http_request_duration_seconds,
+            service_up,
+        }
+    }
+
+    pub fn record_http_request(
+        &self,
+        method: &str,
+        route: &str,
+        status: u16,
+        duration_seconds: f64,
+    ) {
+        self.http_requests_total
+            .with_label_values(&[method, route, &status.to_string()])
+            .inc();
+        self.http_request_duration_seconds
+            .with_label_values(&[method, route])
+            .observe(duration_seconds);
+    }
+
+    pub fn render(&self) -> String {
+        let metric_families = self.registry.gather();
+        let mut buffer = Vec::new();
+        let encoder = TextEncoder::new();
+        encoder
+            .encode(&metric_families, &mut buffer)
+            .expect("Prometheus encoder must succeed");
+        String::from_utf8(buffer).expect("Prometheus output must be UTF-8")
+    }
+}
+
+pub fn global_metrics() -> &'static MetricsCollector {
+    static GLOBAL: OnceLock<MetricsCollector> = OnceLock::new();
+    GLOBAL.get_or_init(MetricsCollector::new)
+}
+
+async fn metrics_handler() -> impl IntoResponse {
+    let output = global_metrics().render();
+    (axum::http::StatusCode::OK, output)
+}
+
+async fn health_handler() -> impl IntoResponse {
+    Json(serde_json::json!({ "status": "ok", "service": "edgecontroller" }))
+}
+
+pub async fn serve_metrics(bind_address: SocketAddr) {
+    let app = Router::new()
+        .route("/metrics", get(metrics_handler))
+        .route("/health", get(health_handler));
+
+    let listener = match tokio::net::TcpListener::bind(bind_address).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            tracing::warn!(%bind_address, %error, "metrics exporter bind failed");
+            return;
+        }
+    };
+
+    tracing::info!(address = %listener.local_addr().unwrap_or(bind_address), "metrics exporter listening on port 8081");
+    let _ = axum::serve(listener, app).await;
 }
 
 fn percentage(used: u64, total: u64) -> f64 {
@@ -94,8 +215,6 @@ fn cpu_frequencies() -> (f64, f64) {
     let maximum = frequency_from_sysfs("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")
         .unwrap_or(current);
 
-    // Legacy schema has no representation for unavailable frequency.
-    // Only these optional frequency fields use zero as unavailable.
     (current, maximum)
 }
 
@@ -130,10 +249,6 @@ fn memory_bytes() -> AppResult<(u64, u64)> {
     Ok((total.saturating_sub(available), total))
 }
 
-/// Preserve the legacy wired-interface filter.
-///
-/// This intentionally excludes wlan interfaces. Change the filter here if
-/// the backend should report Wi-Fi traffic as well.
 fn network_bytes() -> AppResult<(u64, u64)> {
     let text = fs::read_to_string("/proc/net/dev")?;
     let mut received = 0_u64;
@@ -182,7 +297,6 @@ fn root_disk_bytes() -> AppResult<(u64, u64)> {
 
 impl MetricSampler {
     pub fn heartbeat(&mut self, uid: String, ip: String) -> AppResult<HeartbeatPayload> {
-        // Read all required metrics before advancing either baseline.
         let (idle, total_ticks) = cpu_ticks()?;
         let (received, transmitted) = network_bytes()?;
         let (memory_used, memory_total) = memory_bytes()?;
@@ -208,9 +322,7 @@ impl MetricSampler {
 
                 if elapsed > 0.0 {
                     (
-                        transmitted.saturating_sub(previous_tx) as f64 * 8.0
-                            / elapsed
-                            / 1_000_000.0,
+                        transmitted.saturating_sub(previous_tx) as f64 * 8.0 / elapsed / 1_000_000.0,
                         received.saturating_sub(previous_rx) as f64 * 8.0 / elapsed / 1_000_000.0,
                     )
                 } else {
@@ -245,7 +357,7 @@ impl MetricSampler {
 
 #[cfg(test)]
 mod tests {
-    use super::percentage;
+    use super::{percentage, MetricsCollector};
 
     #[test]
     fn percentage_handles_zero_capacity() {
@@ -256,5 +368,19 @@ mod tests {
     fn percentage_is_bounded() {
         assert_eq!(percentage(25, 100), 25.0);
         assert_eq!(percentage(150, 100), 100.0);
+    }
+
+    #[test]
+    fn http_metrics_record_status_and_elapsed_time() {
+        let metrics = MetricsCollector::new();
+        metrics.record_http_request("GET", "/health", 200, 0.025);
+
+        let output = metrics.render();
+        assert!(output.contains(
+            "edgecontroller_http_requests_total{method=\"GET\",route=\"/health\",status=\"200\"} 1"
+        ));
+        assert!(output.contains(
+            "edgecontroller_http_request_duration_seconds_sum{method=\"GET\",route=\"/health\"} 0.025"
+        ));
     }
 }

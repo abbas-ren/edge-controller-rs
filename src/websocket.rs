@@ -6,7 +6,7 @@
 
 use crate::{
     error::{AppError, AppResult},
-    metrics::MetricSampler,
+    observability::metrics::MetricSampler,
     state::AppState,
 };
 
@@ -41,6 +41,14 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const PONG_TIMEOUT: Duration = Duration::from_secs(70);
+
+fn next_retry_delay(current: Duration, session_elapsed: Duration) -> Duration {
+    if session_elapsed >= Duration::from_secs(30) {
+        Duration::from_secs(2)
+    } else {
+        (current * 2).min(Duration::from_secs(60))
+    }
+}
 
 async fn send(socket: &mut Socket, message: Message) -> AppResult<()> {
     time::timeout(WRITE_TIMEOUT, socket.send(message))
@@ -259,13 +267,30 @@ pub async fn websocket_loop(state: Arc<AppState>) {
 
         // Reset backoff after a reasonably stable connection. Repeated
         // immediate failures otherwise back off to at most one minute.
-        if started.elapsed() >= Duration::from_secs(30) {
-            retry_delay = Duration::from_secs(2);
-        }
+        let next_delay = next_retry_delay(retry_delay, started.elapsed());
+        info!(
+            uid = %uid,
+            retry_after = ?next_delay,
+            session_elapsed = ?started.elapsed(),
+            "WebSocket session ended; retrying connection"
+        );
 
-        time::sleep(retry_delay).await;
-        retry_delay = (retry_delay * 2).min(Duration::from_secs(60));
+        time::sleep(next_delay).await;
+        retry_delay = next_delay;
     }
 
     info!("WebSocket service stopped");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_retry_delay;
+    use std::time::Duration;
+
+    #[test]
+    fn reconnect_backoff_resets_after_a_stable_session() {
+        assert_eq!(next_retry_delay(Duration::from_secs(2), Duration::from_secs(31)), Duration::from_secs(2));
+        assert_eq!(next_retry_delay(Duration::from_secs(2), Duration::from_secs(10)), Duration::from_secs(4));
+        assert_eq!(next_retry_delay(Duration::from_secs(60), Duration::from_secs(10)), Duration::from_secs(60));
+    }
 }

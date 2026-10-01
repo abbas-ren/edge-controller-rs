@@ -9,7 +9,15 @@ use crate::{
     FeatureFlags,
 };
 
-use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use tokio::sync::{Mutex, RwLock};
 
@@ -41,6 +49,7 @@ pub struct AppState {
     pub api_token: Option<String>,
     pub hardware: HardwarePolicy,
     pub features: FeatureFlags,
+    pub registration_done: AtomicBool,
 }
 
 impl AppState {
@@ -140,6 +149,7 @@ impl AppState {
             api_token,
             hardware,
             features,
+            registration_done: AtomicBool::new(false),
         });
 
         let controller_uid = state.controller.read().await.uid.clone();
@@ -199,6 +209,10 @@ impl AppState {
             uid: controller.uid.clone(),
         }
     }
+
+    pub fn try_begin_registration(&self) -> bool {
+        !self.registration_done.swap(true, Ordering::AcqRel)
+    }
 }
 
 /// Legacy normalization helper, retained for existing internal callers.
@@ -213,4 +227,31 @@ pub fn normalize_mac(value: &str) -> String {
         .chars()
         .filter(|character| !matches!(character, ':' | '-' | ' '))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn registration_guard_only_allows_one_transition() {
+        let guard = AtomicBool::new(false);
+
+        assert!(std::sync::atomic::AtomicBool::compare_exchange(
+            &guard,
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok());
+        assert!(!std::sync::atomic::AtomicBool::compare_exchange(
+            &guard,
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok());
+    }
 }

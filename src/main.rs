@@ -1,4 +1,6 @@
+mod cli;
 mod config;
+mod constants;
 mod error;
 mod gpio;
 mod hardware;
@@ -6,393 +8,26 @@ mod http;
 mod ipl;
 mod jobs;
 mod logging;
-mod metrics;
 mod models;
+mod observability;
 mod relay;
+mod runtime;
 mod state;
 mod store;
 mod uart;
 mod usb;
 mod websocket;
 
+pub use cli::{Cli, FeatureFlags, USAGE};
+
 use anyhow::{anyhow, Context, Result};
 use state::AppState;
 use std::{
     net::SocketAddr,
-    sync::{atomic::Ordering, Arc},
+    sync::atomic::Ordering,
     time::Duration,
 };
-use tracing::{debug, info, warn};
-
-const USAGE: &str = "\
-Usage:
-  dev-controller-rs [CONFIG]
-  dev-controller-rs [--enable-gen3|--enable-gen4|--enable-gen5|--enable-rtos] [CONFIG]
-  dev-controller-rs --check [CONFIG]
-  dev-controller-rs --log-level LEVEL [CONFIG]
-  dev-controller-rs --verbose [CONFIG]
-  dev-controller-rs --help
-
-CONFIG defaults to /etc/config/login.cfg.
-
---check validates configuration, environment overrides, hardware policy,
-and persisted state without accessing hardware or contacting the backend.
-It does not modify or repair files.
-
---enable-gen3 enables Gen3 relay-only behavior.
---enable-gen4 enables Gen4 relay/flash behavior.
---enable-gen5 enables Gen5 power/UART mapping and IPL behavior.
---enable-rtos enables RTOS capture endpoints.
-
---log-level accepts trace|debug|info|warn|error.
---verbose sets debug logging for troubleshooting.
-";
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct FeatureFlags {
-    pub gen3: bool,
-    pub gen4: bool,
-    pub gen5: bool,
-    pub rtos: bool,
-}
-
-impl FeatureFlags {
-    pub fn generation_enabled(&self, generation: u8) -> bool {
-        match generation {
-            3 => self.gen3,
-            4 => self.gen4,
-            5 => self.gen5,
-            _ => false,
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum Cli {
-    Help,
-    Start {
-        config_path: String,
-        check_only: bool,
-        log_level: Option<String>,
-        features: FeatureFlags,
-    },
-}
-
-impl Cli {
-    fn parse<I>(arguments: I) -> Result<Self>
-    where
-        I: IntoIterator<Item = std::ffi::OsString>,
-    {
-        let mut config_path = None;
-        let mut check_only = false;
-        let mut help = false;
-        let mut log_level = None;
-        let mut features = FeatureFlags::default();
-        let mut arguments = arguments.into_iter().peekable();
-
-        while let Some(argument) = arguments.next() {
-            let argument = argument
-                .into_string()
-                .map_err(|_| anyhow!("command-line arguments must be valid UTF-8"))?;
-
-            match argument.as_str() {
-                "--help" | "-h" => {
-                    if help {
-                        return Err(anyhow!("help flag supplied more than once"));
-                    }
-                    help = true;
-                }
-
-                "--check" => {
-                    if check_only {
-                        return Err(anyhow!("--check supplied more than once"));
-                    }
-                    check_only = true;
-                }
-
-                "--enable-gen3" => {
-                    if features.gen3 {
-                        return Err(anyhow!("--enable-gen3 supplied more than once"));
-                    }
-                    features.gen3 = true;
-                }
-
-                "--enable-gen4" => {
-                    if features.gen4 {
-                        return Err(anyhow!("--enable-gen4 supplied more than once"));
-                    }
-                    features.gen4 = true;
-                }
-
-                "--enable-gen5" => {
-                    if features.gen5 {
-                        return Err(anyhow!("--enable-gen5 supplied more than once"));
-                    }
-                    features.gen5 = true;
-                }
-
-                "--enable-rtos" => {
-                    if features.rtos {
-                        return Err(anyhow!("--enable-rtos supplied more than once"));
-                    }
-                    features.rtos = true;
-                }
-
-                "-v" | "--verbose" => {
-                    if log_level.is_some() {
-                        return Err(anyhow!("log level supplied more than once"));
-                    }
-                    log_level = Some("debug".to_owned());
-                }
-
-                "--log-level" => {
-                    let value = arguments
-                        .next()
-                        .ok_or_else(|| anyhow!("--log-level requires a value: trace|debug|info|warn|error"))?
-                        .into_string()
-                        .map_err(|_| anyhow!("log level must be valid UTF-8"))?;
-
-                    let level = value.to_ascii_lowercase();
-                    match level.as_str() {
-                        "trace" | "debug" | "info" | "warn" | "error" => {
-                            if log_level.is_some() {
-                                return Err(anyhow!("log level supplied more than once"));
-                            }
-                            log_level = Some(level);
-                        }
-                        _ => {
-                            return Err(anyhow!(
-                                "invalid log level: {value}; expected trace|debug|info|warn|error"
-                            ));
-                        }
-                    }
-                }
-
-                value if value.starts_with('-') => {
-                    return Err(anyhow!("unknown option: {value}"));
-                }
-
-                "" => {
-                    return Err(anyhow!("configuration pathname must not be empty"));
-                }
-
-                value => {
-                    if config_path.replace(value.to_owned()).is_some() {
-                        return Err(anyhow!("only one configuration pathname may be supplied"));
-                    }
-                }
-            }
-        }
-
-        if help {
-            if check_only || config_path.is_some() || log_level.is_some() || features != FeatureFlags::default() {
-                return Err(anyhow!("--help must be used on its own"));
-            }
-
-            return Ok(Self::Help);
-        }
-
-        Ok(Self::Start {
-            config_path: config_path.unwrap_or_else(|| config::LOGIN_PATH.to_owned()),
-            check_only,
-            log_level,
-            features,
-        })
-    }
-}
-
-/// Read the selected interface's MAC and IPv4 address.
-///
-/// For a Raspberry Pi, use DEV_CONTROLLER_INTERFACE=eth0 or wlan0
-/// rather than inheriting the legacy Gen5 default of eno1.
-fn interface_identity(interface: &str) -> Result<(String, String)> {
-    if interface.is_empty()
-        || !interface
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
-    {
-        return Err(anyhow!("invalid interface name"));
-    }
-
-    let mac = std::fs::read_to_string(format!("/sys/class/net/{interface}/address"))?
-        .trim()
-        .to_owned();
-
-    let address = if_addrs::get_if_addrs()?
-        .into_iter()
-        .find(|entry| entry.name == interface && entry.ip().is_ipv4())
-        .ok_or_else(|| anyhow!("no IPv4 address found on interface {interface}"))?
-        .ip()
-        .to_string();
-
-    Ok((mac, address))
-}
-
-/// Single-shot registration before the controller starts serving live traffic.
-///
-/// The backend creates the session or device record after receiving this POST.
-/// The code intentionally does not retry here because the requirement is to send
-/// one registration message once per process lifetime, immediately after the
-/// listener is bound and ready for the peer to connect back to us.
-async fn registration_loop(state: Arc<AppState>, inventory: Vec<models::RelayInventory>) {
-    let url = format!(
-        "http://{}:{}/api/v1/device/controller/",
-        state.cfg.server_ip, state.cfg.http_port
-    );
-
-    if *state.reboot.read().await {
-        warn!("registration skipped because the controller is already shutting down");
-        return;
-    }
-
-    // The payload can include the UID once the backend has confirmed it.
-    let payload = state.registration_payload(inventory).await;
-
-    info!(%url, "registering controller with backend once at process startup");
-    debug!(payload = ?payload, "registration payload prepared for backend");
-
-    match serde_json::to_string_pretty(&payload) {
-        Ok(json) => info!(body = %json, "backend registration payload"),
-        Err(error) => warn!(%error, "failed to pretty-print registration payload for logging"),
-    }
-
-    match state.client.post(&url).json(&payload).send().await {
-        Ok(response) => {
-            let status = response.status();
-            match response.text().await {
-                Ok(body) => {
-                    info!(status = %status, body = %body, "registration response received");
-
-                    if status.is_success() {
-                        info!("controller registration request accepted by backend");
-                    } else {
-                        warn!(status = %status, body = %body, "backend rejected registration request");
-                    }
-                }
-                Err(error) => {
-                    warn!(%error, "failed to read backend registration response body");
-                }
-            }
-        }
-        Err(error) => {
-            warn!(%error, "registration HTTP request failed; backend may still be starting" );
-        }
-    }
-}
-
-/// Signal all capture workers before awaiting any individual worker.
-///
-/// Serial reads use a short timeout, allowing workers to observe the stop
-/// flag without terminating threads or closing descriptors from elsewhere.
-///
-/// No timeout is imposed on joining workers: abandoning a spawn_blocking
-/// handle would not actually stop its underlying thread.
-async fn stop_captures(state: &AppState) {
-    let sessions = {
-        let mut active = state.rtos_sessions.lock().await;
-
-        for session in active.values() {
-            session.stop.store(true, Ordering::Release);
-        }
-
-        std::mem::take(&mut *active)
-    };
-
-    for (tty, mut session) in sessions {
-        if let Some(handle) = session.handle.take() {
-            match handle.await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    warn!(%tty, %error, "capture worker stopped with an error");
-                }
-                Err(error) => {
-                    warn!(%tty, %error, "capture worker could not be joined");
-                }
-            }
-        }
-
-        // Dropping the NamedTempFile removes the capture pathname.
-        // Capture files are not retained across service shutdown.
-        drop(session);
-    }
-}
-
-/// Validate the configured files without opening hardware or network sockets.
-///
-/// Run with the service stopped if a stable cross-file snapshot is required.
-/// Individual state-file replacement is atomic, but reading multiple files
-/// is not a filesystem-wide transaction.
-fn check_offline(
-    cfg: &config::AppConfig,
-    config_path: &str,
-    hardware_path: &str,
-    bind_address: SocketAddr,
-    authentication_enabled: bool,
-) -> Result<()> {
-    use std::path::Path;
-
-    cfg.validate().context("validating service configuration")?;
-
-    // Require the state directories to exist. Missing state files are valid
-    // first-run state, but a missing storage directory is an installation
-    // problem that would prevent the first write.
-    //
-    // This is a read-only structural check, not proof of write permission.
-    for filename in [
-        config::UID_FILE,
-        config::USB_MAPPING_FILE,
-        config::GEN5_MAPPING_FILE,
-    ] {
-        let parent = Path::new(filename)
-            .parent()
-            .ok_or_else(|| anyhow!("state pathname has no parent: {filename}"))?;
-
-        let metadata = std::fs::symlink_metadata(parent)
-            .with_context(|| format!("inspecting state directory {}", parent.display()))?;
-
-        if !metadata.file_type().is_dir() {
-            return Err(anyhow!(
-                "state parent must be a directory, not a symlink or special file: {}",
-                parent.display()
-            ));
-        }
-    }
-
-    let policy =
-        hardware::HardwarePolicy::load(hardware_path).context("validating hardware policy")?;
-
-    let (usb, gen5) = store::load_mappings(
-        Path::new(config::USB_MAPPING_FILE),
-        Path::new(config::GEN5_MAPPING_FILE),
-        &policy,
-    )
-    .context("validating persisted mappings")?;
-
-    let uid = store::load_uid(Path::new(config::UID_FILE))
-        .context("validating persisted controller ID")?;
-
-    // Do not print the bearer token or controller ID.
-    let report = serde_json::json!({
-        "status": "valid",
-        "configuration": config_path,
-        "hardware_policy": hardware_path,
-        "generation": cfg.gen.as_int(),
-        "interface": cfg.iface_name,
-        "listen_address": bind_address.to_string(),
-        "authentication_enabled": authentication_enabled,
-        "approved_boards": policy.boards.len(),
-        "usb_mapping_count": usb.len(),
-        "gen5_mapping_count": gen5.len(),
-        "controller_id_present": uid.is_some(),
-        "hardware_checked": false,
-        "network_checked": false,
-        "write_permissions_checked": false,
-        "files_modified": false
-    });
-
-    println!("{}", serde_json::to_string_pretty(&report)?);
-    Ok(())
-}
+use tracing::{info, warn};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -408,8 +43,10 @@ async fn main() -> Result<()> {
         .context("installing SIGINT handler")?;
 
     // Optional first argument overrides the legacy configuration pathname.
-    let (config_path, check_only, log_level, features) =
-        match Cli::parse(std::env::args_os().skip(1))? {
+    let cli = Cli::parse(std::env::args_os())?;
+
+    let (config_path, check_only, log_level, log_file, log_network, log_stream, metrics_port, bind_port, features) =
+        match cli {
             Cli::Help => {
                 print!("{USAGE}");
                 return Ok(());
@@ -418,23 +55,58 @@ async fn main() -> Result<()> {
                 config_path,
                 check_only,
                 log_level,
+                log_file,
+                log_network,
+                log_stream,
+                metrics_port,
+                bind_port,
                 features,
-            } => (config_path, check_only, log_level, features),
+            } => (
+                config_path,
+                check_only,
+                log_level,
+                log_file,
+                log_network,
+                log_stream,
+                metrics_port,
+                bind_port,
+                features,
+            ),
         };
 
-    logging::init_logging(log_level.as_deref());
+    logging::init_logging(log_level.as_deref(), log_file.as_deref(), log_network, log_stream);
+
+    info!(
+        config_path = %config_path,
+        metrics_port,
+        bind_port,
+        check_only,
+        log_level = log_level.as_deref().unwrap_or("info"),
+        log_network,
+        log_stream,
+        "controller startup configuration selected"
+    );
 
     let mut cfg = config::AppConfig::load_legacy_cfg(&config_path)
         .with_context(|| format!("loading configuration from {config_path}"))?;
 
     match std::env::var("DEV_CONTROLLER_INTERFACE") {
-        Ok(interface) => cfg.iface_name = interface,
+        Ok(interface) => {
+            info!(interface = %interface, "DEV_CONTROLLER_INTERFACE override applied");
+            cfg.iface_name = interface;
+        }
         Err(std::env::VarError::NotPresent) => {}
         Err(std::env::VarError::NotUnicode(_)) => {
             return Err(anyhow!("DEV_CONTROLLER_INTERFACE must be valid UTF-8"));
         }
     }
 
+    cfg.bind_port = bind_port;
+    info!(
+        configured_interface = %cfg.iface_name,
+        configured_bind_port = cfg.bind_port,
+        "runtime network configuration prepared"
+    );
     cfg.validate()
         .context("validating configuration overrides")?;
 
@@ -442,7 +114,10 @@ async fn main() -> Result<()> {
     // authentication. Override explicitly when deploying behind an
     // authenticated proxy or on an appropriately restricted network.
     let bind_value = match std::env::var("DEV_CONTROLLER_BIND") {
-        Ok(value) => value,
+        Ok(value) => {
+            info!(bind = %value, "DEV_CONTROLLER_BIND override applied");
+            value
+        }
         Err(std::env::VarError::NotPresent) => {
             format!("0.0.0.0:{}", cfg.bind_port)
         }
@@ -472,7 +147,7 @@ async fn main() -> Result<()> {
     // This branch must precede signal installation, interface discovery,
     // AppState construction, USB inventory, and server startup.
     if check_only {
-        return check_offline(
+        return runtime::check_offline(
             &cfg,
             &config_path,
             &hardware_path,
@@ -483,7 +158,7 @@ async fn main() -> Result<()> {
 
     // Network discovery is synchronous and runs before request handling.
     let interface = cfg.iface_name.clone();
-    let (mac, ip) = tokio::task::spawn_blocking(move || interface_identity(&interface))
+    let (mac, ip) = tokio::task::spawn_blocking(move || runtime::interface_identity(&interface))
         .await
         .context("network discovery worker failed")??;
 
@@ -511,8 +186,12 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("binding HTTP listener to {bind_address}"))?;
 
+    let metrics_addr = std::net::SocketAddr::from(([0, 0, 0, 0], metrics_port));
+    let metrics_task = tokio::spawn(observability::metrics::serve_metrics(metrics_addr));
+
     info!(
         address = %listener.local_addr()?,
+        metrics_address = %metrics_addr,
         "HTTP listener ready"
     );
 
@@ -525,7 +204,7 @@ async fn main() -> Result<()> {
     // The registration is intentionally a single message after the listener is
     // bound and ready. This gives the backend a chance to establish any
     // callback or reverse connection using the payload we send.
-    let registration_task = tokio::spawn(registration_loop(state.clone(), inventory));
+    let registration_task = tokio::spawn(runtime::registration_loop(state.clone(), inventory));
     let websocket_task = tokio::spawn(websocket::websocket_loop(state.clone()));
 
     let shutdown_state = state.clone();
@@ -589,6 +268,8 @@ async fn main() -> Result<()> {
     registration_task.abort();
     websocket_task.abort();
 
+    metrics_task.abort();
+
     for (name, handle) in [
         ("registration", registration_task),
         ("websocket", websocket_task),
@@ -600,7 +281,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    stop_captures(&state).await;
+    runtime::stop_captures(&state).await;
 
     match tokio::task::spawn_blocking(gpio::GpioController::stop).await {
         Ok(Ok(())) => {}
@@ -614,159 +295,4 @@ async fn main() -> Result<()> {
 
     info!("controller service stopped");
     server_result.context("HTTP server failed")
-}
-
-#[cfg(test)]
-mod cli_tests {
-    use super::{Cli, FeatureFlags, USAGE};
-    use std::ffi::OsString;
-
-    fn arguments(values: &[&str]) -> Vec<OsString> {
-        values.iter().map(OsString::from).collect()
-    }
-
-    #[test]
-    fn no_arguments_selects_default_configuration() {
-        assert_eq!(
-            Cli::parse(arguments(&[])).unwrap(),
-            Cli::Start {
-                config_path: crate::config::LOGIN_PATH.into(),
-                check_only: false,
-                log_level: None,
-                features: FeatureFlags {
-                    gen3: false,
-                    gen4: false,
-                    gen5: false,
-                    rtos: false,
-                },
-            }
-        );
-    }
-
-    #[test]
-    fn feature_flags_are_parsed_explicitly() {
-        assert_eq!(
-            Cli::parse(arguments(&["--enable-gen4", "--enable-rtos"])).unwrap(),
-            Cli::Start {
-                config_path: crate::config::LOGIN_PATH.into(),
-                check_only: false,
-                log_level: None,
-                features: FeatureFlags {
-                    gen3: false,
-                    gen4: true,
-                    gen5: false,
-                    rtos: true,
-                },
-            }
-        );
-    }
-
-    #[test]
-    fn positional_configuration_is_preserved() {
-        assert_eq!(
-            Cli::parse(arguments(&["/etc/dev-controller/custom.cfg",])).unwrap(),
-            Cli::Start {
-                config_path: "/etc/dev-controller/custom.cfg".into(),
-                check_only: false,
-                log_level: None,
-                features: FeatureFlags {
-                    gen3: false,
-                    gen4: false,
-                    gen5: false,
-                    rtos: false,
-                },
-            }
-        );
-    }
-
-    #[test]
-    fn check_accepts_default_or_explicit_configuration() {
-        assert_eq!(
-            Cli::parse(arguments(&["--check"])).unwrap(),
-            Cli::Start {
-                config_path: crate::config::LOGIN_PATH.into(),
-                check_only: true,
-                log_level: None,
-                features: FeatureFlags {
-                    gen3: false,
-                    gen4: false,
-                    gen5: false,
-                    rtos: false,
-                },
-            }
-        );
-
-        for values in [
-            vec!["--check", "/tmp/controller.cfg"],
-            vec!["/tmp/controller.cfg", "--check"],
-        ] {
-            assert_eq!(
-                Cli::parse(arguments(&values)).unwrap(),
-                Cli::Start {
-                    config_path: "/tmp/controller.cfg".into(),
-                    check_only: true,
-                    log_level: None,
-                    features: FeatureFlags {
-                        gen3: false,
-                        gen4: false,
-                        gen5: false,
-                        rtos: false,
-                    },
-                }
-            );
-        }
-    }
-
-    #[test]
-    fn help_is_standalone() {
-        assert_eq!(Cli::parse(arguments(&["--help"])).unwrap(), Cli::Help);
-
-        assert_eq!(Cli::parse(arguments(&["-h"])).unwrap(), Cli::Help);
-
-        assert_eq!(
-            Cli::parse(arguments(&["--log-level", "debug"])).unwrap(),
-            Cli::Start {
-                config_path: crate::config::LOGIN_PATH.into(),
-                check_only: false,
-                log_level: Some("debug".to_owned()),
-                features: FeatureFlags {
-                    gen3: false,
-                    gen4: false,
-                    gen5: false,
-                    rtos: false,
-                },
-            }
-        );
-
-        assert!(Cli::parse(arguments(&["--help", "--check"])).is_err());
-
-        assert!(Cli::parse(arguments(&["--help", "/tmp/config"])).is_err());
-
-        assert!(USAGE.contains("--check"));
-    }
-
-    #[test]
-    fn duplicate_and_unknown_options_are_rejected() {
-        for values in [
-            vec!["--check", "--check"],
-            vec!["--help", "--help"],
-            vec!["--unknown"],
-            vec!["first.cfg", "second.cfg"],
-            vec![""],
-        ] {
-            assert!(
-                Cli::parse(arguments(&values)).is_err(),
-                "unexpectedly accepted {values:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn non_utf8_argument_is_rejected() {
-        use std::os::unix::ffi::OsStringExt;
-
-        let invalid = OsString::from_vec(vec![b'c', b'f', b'g', 0xff]);
-
-        assert!(Cli::parse([invalid]).is_err());
-    }
 }

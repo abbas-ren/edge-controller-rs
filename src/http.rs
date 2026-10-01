@@ -1,3 +1,8 @@
+mod gen4;
+mod gen5;
+mod relay;
+mod rtos;
+
 use crate::{jobs::Lease, state::RtosSession};
 use axum::{
     body::{to_bytes, Body},
@@ -5,7 +10,7 @@ use axum::{
     http::{header, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
 
@@ -26,6 +31,7 @@ use crate::store::{Gen5Mappings, UsbMappings};
 use crate::{
     config::*,
     ipl,
+    observability::metrics::global_metrics,
     models::*,
     state::AppState,
     uart::{open_uart, write_to_path},
@@ -74,6 +80,26 @@ fn token_matches(expected: &[u8], supplied: &[u8]) -> bool {
 
 async fn request_guard(
     State(state): State<Arc<AppState>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let started = std::time::Instant::now();
+    let response = guarded_request(state, request, next).await;
+
+    global_metrics().record_http_request(
+        method.as_str(),
+        path.as_str(),
+        response.status().as_u16(),
+        started.elapsed().as_secs_f64(),
+    );
+
+    response
+}
+
+async fn guarded_request(
+    state: Arc<AppState>,
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
@@ -679,6 +705,34 @@ fn resolve_gen5_mapping_sync(
     Ok(Some((uart, power)))
 }
 
+async fn health_handler() -> Response {
+    debug!("service health endpoint invoked");
+    ok().into_response()
+}
+
+async fn status_handler(State(state): State<Arc<AppState>>) -> Response {
+    let controller = state.controller.read().await;
+    let payload = serde_json::json!({
+        "status": "ok",
+        "generation": state.cfg.gen.as_int(),
+        "board_mac": controller.board_mac,
+        "board_ip": controller.board_ip,
+        "uid": controller.uid,
+        "features": {
+            "gen3": state.features.gen3,
+            "gen4": state.features.gen4,
+            "gen5": state.features.gen5,
+            "rtos": state.features.rtos,
+        }
+    });
+    Json(payload).into_response()
+}
+
+async fn metrics_handler() -> Response {
+    let output = global_metrics().render();
+    (StatusCode::OK, output).into_response()
+}
+
 fn ok() -> Json<serde_json::Value> {
     debug!("generic success response generated");
     Json(serde_json::json!({"OK": true}))
@@ -709,37 +763,42 @@ macro_rules! log_handler_request {
 
 pub fn router(state: Arc<AppState>) -> Router {
     let mut router = Router::new()
+        .route("/health", get(health_handler))
+        .route("/status", get(status_handler))
+        .route("/metrics", get(metrics_handler))
+        .route("/swagger.json", get(crate::observability::swagger::swagger_json))
+        .route("/docs", get(crate::observability::swagger::swagger_ui))
         .route("/confirmation", post(confirmation));
 
     if state.features.gen3 || state.features.gen4 {
         router = router
-            .route("/relay", post(relay))
-            .route("/relay/status", post(relay_status))
-            .route("/relay/config", post(relay_config))
-            .route("/relay/delete", post(relay_delete))
-            .route("/devCon/delete", post(devcon_delete))
-            .route("/mapping/entry", post(mapping_entry))
-            .route("/reboot-device", post(reboot_device));
+            .route("/relay", post(relay::relay_handler))
+            .route("/relay/status", post(relay::relay_status_handler))
+            .route("/relay/config", post(relay::relay_config_handler))
+            .route("/relay/delete", post(relay::relay_delete_handler))
+            .route("/devCon/delete", post(relay::devcon_delete_handler))
+            .route("/mapping/entry", post(gen5::mapping_entry_handler))
+            .route("/reboot-device", post(gen4::reboot_device_handler));
     }
 
     if state.features.gen4 || state.features.gen5 {
         router = router
-            .route("/ipl", post(ipl_run))
-            .route("/ipl-mode", post(ipl_mode))
-            .route("/ipl-mode/default", post(ipl_mode_default))
-            .route("/ipl/remove", post(ipl_remove));
+            .route("/ipl", post(gen4::ipl_run_handler))
+            .route("/ipl-mode", post(gen4::ipl_mode_handler))
+            .route("/ipl-mode/default", post(gen4::ipl_mode_default_handler))
+            .route("/ipl/remove", post(gen4::ipl_remove_handler));
     }
 
     if state.features.gen5 {
         router = router
-            .route("/gen5/tty_entry", post(gen5_tty_entry))
-            .route("/gen5/power", post(gen5_power));
+            .route("/gen5/tty_entry", post(gen5::gen5_tty_entry_handler))
+            .route("/gen5/power", post(gen5::gen5_power_handler));
     }
 
     if state.features.rtos {
         router = router
-            .route("/rtos/start", post(rtos_start))
-            .route("/rtos/end", post(rtos_end));
+            .route("/rtos/start", post(rtos::rtos_start_handler))
+            .route("/rtos/end", post(rtos::rtos_end_handler));
     }
 
     router

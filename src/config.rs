@@ -16,10 +16,15 @@ use crate::{
 use serde::Serialize;
 use std::{collections::BTreeMap, fs, net::Ipv4Addr, path::Path};
 
+#[allow(dead_code)]
 pub const UID_FILE: &str = "/var/log/uid";
+#[allow(dead_code)]
 pub const GEN5_POWER_TTY: &str = "/var/log/gen5_power.csv";
+#[allow(dead_code)]
 pub const GEN5_UART_TTY: &str = "/var/log/gen5_uart.csv";
+#[allow(dead_code)]
 pub const USB_MAPPING_FILE: &str = "/var/log/usb_mapping.csv";
+#[allow(dead_code)]
 pub const GEN5_MAPPING_FILE: &str = "/var/log/gen5_mapping.csv";
 // These paths are retained for compatibility with the legacy controller layout,
 // even though the active runtime currently persists state through the dedicated
@@ -29,6 +34,7 @@ pub const GEN5_MAPPING_FILE: &str = "/var/log/gen5_mapping.csv";
 pub const TEMP_FILE_PATH: &str = "/var/log/temp.csv";
 #[allow(dead_code)]
 pub const LOG_PATH: &str = "/var/log/dev-controller.log";
+#[allow(dead_code)]
 pub const LOGIN_PATH: &str = "/etc/config/login.cfg";
 #[allow(dead_code)]
 pub const GEN5_IPL_LOG_PREFIX: &str = "/var/log/gen5-ipl";
