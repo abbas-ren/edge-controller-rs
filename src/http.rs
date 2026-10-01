@@ -22,11 +22,12 @@ use std::{
 use tokio::task;
 use tracing::{error, warn};
 
+use crate::store::{Gen5Mappings, UsbMappings};
 use crate::{
     config::*,
     ipl,
     models::*,
-    state::{normalize_mac, AppState},
+    state::AppState,
     uart::{open_uart, write_to_path},
     usb::*,
 };
@@ -45,10 +46,6 @@ const MAX_CAPTURE_BYTES: u64 = 64 * 1024 * 1024;
 /// This does not serialize the separate relay, power, or IPL endpoints.
 /// Clients must not issue those operations while discovery is running.
 static MAPPING_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-type UsbMappings = std::collections::HashMap<(String, String, u8), String>;
-
-type Gen5Mappings = std::collections::HashMap<String, Gen5MapEntry>;
 
 /// Compare equal-length tokens without early exit on differing bytes.
 ///
@@ -73,6 +70,8 @@ async fn request_guard(
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
+    tracing::debug!(path = %request.uri(), "HTTP request entering request guard");
+
     if let Some(expected) = state.api_token.as_deref() {
         let supplied = request
             .headers()
@@ -115,8 +114,11 @@ async fn request_guard(
     );
 
     if !hardware_operation {
+        tracing::debug!(path = %request.uri(), "non-hardware request passed through without a lease");
         return next.run(request).await;
     }
+
+    tracing::info!(path = %request.uri(), "accepting hardware operation under lease");
 
     let lease = match state.jobs.try_enter() {
         Ok(lease) => lease,
@@ -129,11 +131,19 @@ async fn request_guard(
     // capture sessions are allowed.
     let capture_lifecycle = matches!(path.as_str(), "/rtos/start" | "/rtos/end");
 
-    if !capture_lifecycle && !state.rtos_sessions.lock().await.is_empty() {
-        return error_response(
-            "stop and download RTOS captures before changing hardware",
-            StatusCode::CONFLICT,
-        );
+    if !capture_lifecycle {
+        let active_capture_count = state.rtos_sessions.lock().await.len();
+        if active_capture_count > 0 {
+            tracing::warn!(
+                active_capture_count,
+                path = %request.uri(),
+                "hardware request blocked while captures remain active"
+            );
+            return error_response(
+                "stop and download RTOS captures before changing hardware",
+                StatusCode::CONFLICT,
+            );
+        }
     }
 
     // IPL handlers transfer a clone into their tracked background job.
@@ -194,6 +204,7 @@ fn validate_csv_field(name: &str, value: &str) -> crate::error::AppResult<()> {
 /// The file contents are synchronized before rename. This is not a full
 /// power-loss durability guarantee because the parent directory is not
 /// synchronized after rename.
+#[allow(dead_code)]
 fn atomic_mapping_write(destination: &str, contents: &[u8]) -> crate::error::AppResult<()> {
     use crate::error::AppError;
     use std::os::unix::fs::PermissionsExt;
@@ -219,41 +230,24 @@ fn atomic_mapping_write(destination: &str, contents: &[u8]) -> crate::error::App
     Ok(())
 }
 
-fn persist_usb_mappings(mappings: &UsbMappings) -> crate::error::AppResult<()> {
-    let mut lines = Vec::with_capacity(mappings.len());
+/// Call only from blocking workers while holding MAPPING_LOCK.
+fn persist_usb_mappings(state: &AppState, mappings: &UsbMappings) -> crate::error::AppResult<()> {
+    let other = state.gen5_map.blocking_read();
 
-    for ((mac, serial, channel), tty) in mappings {
-        validate_csv_field("TTY", tty)?;
-        validate_csv_field("relay serial", serial)?;
-        let mac = validated_mac(mac)?;
+    crate::store::validate_snapshot(mappings, &other, &state.hardware)?;
 
-        if *channel > 7 {
-            return Err(crate::error::AppError::Msg(
-                "stored relay channel is outside 0..7".into(),
-            ));
-        }
-
-        lines.push(format!("{tty},{mac},{serial},{channel}\n"));
-    }
-
-    // Stable ordering makes configuration diffs and debugging easier.
-    lines.sort_unstable();
-    atomic_mapping_write(USB_MAPPING_FILE, lines.concat().as_bytes())
+    let contents = crate::store::encode_usb(mappings)?;
+    crate::store::atomic_replace(Path::new(USB_MAPPING_FILE), contents.as_bytes())
 }
 
-fn persist_gen5_mappings(mappings: &Gen5Mappings) -> crate::error::AppResult<()> {
-    let mut lines = Vec::with_capacity(mappings.len());
+/// Call only from blocking workers while holding MAPPING_LOCK.
+fn persist_gen5_mappings(state: &AppState, mappings: &Gen5Mappings) -> crate::error::AppResult<()> {
+    let other = state.usb_map.blocking_read();
 
-    for (mac, entry) in mappings {
-        validate_csv_field("UART", &entry.uart)?;
-        validate_csv_field("power TTY", &entry.power)?;
-        let mac = validated_mac(mac)?;
+    crate::store::validate_snapshot(&other, mappings, &state.hardware)?;
 
-        lines.push(format!("{},{},{mac}\n", entry.uart, entry.power));
-    }
-
-    lines.sort_unstable();
-    atomic_mapping_write(GEN5_MAPPING_FILE, lines.concat().as_bytes())
+    let contents = crate::store::encode_gen5(mappings)?;
+    crate::store::atomic_replace(Path::new(GEN5_MAPPING_FILE), contents.as_bytes())
 }
 
 /// Observe a boot after cycling the selected power source.
@@ -310,7 +304,9 @@ where
 /// Avoid treating the FTDI relay controller itself as a board console.
 ///
 /// An FTDI relay can initially have a ttyUSB node before its kernel driver
-/// is detached for libusb access.
+/// is detached for libusb access. This helper exists to make that distinction
+/// explicit while debugging board enumeration problems.
+#[allow(dead_code)]
 fn is_relay_tty(tty: &str) -> bool {
     let Some(name) = Path::new(tty).file_name() else {
         return false;
@@ -384,8 +380,16 @@ fn map_usb_to_mac_sync(
     })?;
 
     if observed.as_deref() != Some(mac.as_str()) {
+        tracing::warn!(
+            mac = %mac,
+            tty = %tty,
+            observed = ?observed,
+            "board probe did not match the requested MAC; mapping not persisted"
+        );
         return Ok(false);
     }
+
+    tracing::info!(%mac, %tty, "board UART mapping verified and will be persisted");
 
     let mut updated = state.usb_map.blocking_read().clone();
 
@@ -402,7 +406,7 @@ fn map_usb_to_mac_sync(
 
     updated.insert((mac, serial, channel), tty);
 
-    persist_usb_mappings(&updated)?;
+    persist_usb_mappings(&state, &updated)?;
     *state.usb_map.blocking_write() = updated;
 
     Ok(true)
@@ -445,7 +449,7 @@ fn resolve_gen5_mapping_sync(
 ) -> crate::error::AppResult<Option<(String, String)>> {
     use crate::error::AppError;
 
-    let mac = validated_mac(&mac)?;
+    let mac = validated_mac(mac)?;
     let _operation = mapping_guard()?;
 
     let binding = state.hardware.board(&mac, 5)?;
@@ -468,8 +472,17 @@ fn resolve_gen5_mapping_sync(
     let observed = probe_gen5_pair(&uart, &power)?;
 
     if observed.as_deref() != Some(mac.as_str()) {
+        tracing::warn!(
+            mac = %mac,
+            uart = %uart,
+            power = %power,
+            observed = ?observed,
+            "Gen5 mapping probe did not confirm the requested board MAC"
+        );
         return Ok(None);
     }
+
+    tracing::info!(%mac, %uart, %power, "Gen5 board mapping verified");
 
     let mut updated = state.gen5_map.blocking_read().clone();
     updated.remove(&mac);
@@ -493,7 +506,7 @@ fn resolve_gen5_mapping_sync(
         },
     );
 
-    persist_gen5_mappings(&updated)?;
+    persist_gen5_mappings(&state, &updated)?;
     *state.gen5_map.blocking_write() = updated;
 
     Ok(Some((uart, power)))
@@ -863,11 +876,15 @@ async fn reboot_device(
 
 async fn confirmation(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<ConfirmationRequest>,
-) -> impl IntoResponse {
-    match state.save_uid(&req.controller_id).await {
-        Ok(_) => ok().into_response(),
-        Err(e) => err_json(&e.to_string(), StatusCode::INTERNAL_SERVER_ERROR).into_response(),
+    Json(request): Json<ConfirmationRequest>,
+) -> Response {
+    if let Err(error) = crate::store::validate_uid(&request.controller_id) {
+        return error_response(error.to_string(), StatusCode::BAD_REQUEST);
+    }
+
+    match state.save_uid(&request.controller_id).await {
+        Ok(()) => ok().into_response(),
+        Err(error) => error_response(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
@@ -901,14 +918,14 @@ fn delete_mappings_sync(
             let mut updated = state.usb_map.blocking_read().clone();
 
             updated.retain(|(stored_mac, stored_serial, stored_channel), _| {
-                let matches = mac.as_ref().map_or(true, |value| value == stored_mac)
-                    && serial.as_ref().map_or(true, |value| value == stored_serial)
-                    && channel.map_or(true, |value| value == *stored_channel);
+                let matches = mac.as_ref().is_none_or(|value| value == stored_mac)
+                    && serial.as_ref().is_none_or(|value| value == stored_serial)
+                    && channel.is_none_or(|value| value == *stored_channel);
 
                 !matches
             });
 
-            persist_usb_mappings(&updated)?;
+            persist_usb_mappings(&state, &updated)?;
             *state.usb_map.blocking_write() = updated;
         }
         Generation::Gen5 => {
@@ -927,7 +944,7 @@ fn delete_mappings_sync(
                 None => updated.clear(),
             }
 
-            persist_gen5_mappings(&updated)?;
+            persist_gen5_mappings(&state, &updated)?;
             *state.gen5_map.blocking_write() = updated;
         }
     }
@@ -1340,15 +1357,7 @@ async fn ipl_remove(
 ///
 /// Exact comparison avoids accepting a prefix of another device's MAC.
 fn validated_mac(value: &str) -> crate::error::AppResult<String> {
-    let normalized = normalize_mac(value);
-
-    if normalized.len() != 12 || !normalized.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(crate::error::AppError::Msg(
-            "MAC address must contain exactly 12 hexadecimal digits".into(),
-        ));
-    }
-
-    Ok(normalized)
+    crate::store::checked_mac(value)
 }
 
 /// Resolve symlinks and restrict serial access to actual USB/ACM character

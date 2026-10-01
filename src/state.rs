@@ -1,9 +1,15 @@
-use crate::config::*;
-use crate::error::{AppError, AppResult};
-use crate::models::RegistrationPayload;
-use crate::relay::RelayController;
-use crate::usb::Gen5MapEntry;
-use std::{collections::HashMap, fs, sync::Arc};
+use crate::{
+    config::*,
+    error::{AppError, AppResult},
+    hardware::HardwarePolicy,
+    jobs::Jobs,
+    models::{RegistrationPayload, RelayInventory},
+    relay::RelayController,
+    store::{self, Gen5Mappings, UsbMappings},
+};
+
+use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
+
 use tokio::sync::{Mutex, RwLock};
 
 #[derive(Debug, Clone)]
@@ -16,159 +22,155 @@ pub struct ControllerInfo {
 #[derive(Debug)]
 pub struct RtosSession {
     pub tty: String,
-    /// Automatically removes the capture pathname when the session is dropped.
     pub file: tempfile::NamedTempFile,
     pub stop: Arc<std::sync::atomic::AtomicBool>,
-    /// Preserve worker errors instead of silently discarding them.
     pub handle: Option<tokio::task::JoinHandle<AppResult<()>>>,
 }
 
-#[derive(Debug)]
 pub struct AppState {
     pub cfg: AppConfig,
     pub controller: RwLock<ControllerInfo>,
-    pub usb_map: RwLock<HashMap<(String, String, u8), String>>,
-    pub gen5_map: RwLock<HashMap<String, Gen5MapEntry>>,
+    pub usb_map: RwLock<UsbMappings>,
+    pub gen5_map: RwLock<Gen5Mappings>,
     pub rtos_sessions: Mutex<HashMap<String, RtosSession>>,
     pub relay: RelayController,
     pub reboot: RwLock<bool>,
     pub client: reqwest::Client,
-    pub hardware: crate::hardware::HardwarePolicy,
-
-    pub jobs: crate::jobs::Jobs,
-
-    /// Optional bearer token. Required by main when listening beyond loopback.
+    pub jobs: Jobs,
     pub api_token: Option<String>,
+    pub hardware: HardwarePolicy,
 }
 
 impl AppState {
     pub async fn new(cfg: AppConfig, board_mac: String, board_ip: String) -> AppResult<Arc<Self>> {
-        let api_token = std::env::var("DEV_CONTROLLER_TOKEN").ok();
+        cfg.validate()?;
+        store::checked_mac(&board_mac)?;
 
-        if api_token
-            .as_ref()
-            .is_some_and(|token| token.len() < 32 || !token.is_ascii())
-        {
+        board_ip
+            .parse::<std::net::Ipv4Addr>()
+            .map_err(|_| AppError::Msg("controller interface IP is not IPv4".into()))?;
+
+        let api_token = configured_api_token()?;
+        let hardware_path = configured_hardware_path()?;
+
+        if api_token.as_ref().is_some_and(|token| {
+            !(32..=256).contains(&token.len()) || !token.bytes().all(|byte| byte.is_ascii_graphic())
+        }) {
             return Err(AppError::Msg(
-                "DEV_CONTROLLER_TOKEN must contain at least 32 ASCII characters".into(),
+                "DEV_CONTROLLER_TOKEN must be 32..256 visible ASCII characters".into(),
             ));
         }
-        let hardware_path = std::env::var("DEV_CONTROLLER_HARDWARE")
-            .unwrap_or_else(|_| "/etc/dev-controller/hardware.json".into());
 
-        let hardware = crate::hardware::HardwarePolicy::load(&hardware_path)?;
+        if !Path::new(&hardware_path).is_absolute() {
+            return Err(AppError::Msg(
+                "DEV_CONTROLLER_HARDWARE must be an absolute pathname".into(),
+            ));
+        }
 
-        AppConfig::ensure_parent(UID_FILE)?;
-        AppConfig::ensure_parent(USB_MAPPING_FILE)?;
-        AppConfig::ensure_parent(GEN5_MAPPING_FILE)?;
-        let uid = fs::read_to_string(UID_FILE)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
+        let (hardware, usb_map, gen5_map, uid) = tokio::task::spawn_blocking(move || {
+            tracing::info!(hardware_path = %hardware_path, "loading hardware policy and persisted state");
+
+            let hardware = HardwarePolicy::load(&hardware_path)?;
+
+            let (usb_map, gen5_map) = store::load_mappings(
+                Path::new(USB_MAPPING_FILE),
+                Path::new(GEN5_MAPPING_FILE),
+                &hardware,
+            )?;
+
+            let uid = store::load_uid(Path::new(UID_FILE))?;
+
+            tracing::debug!(
+                usb_map_count = usb_map.len(),
+                gen5_map_count = gen5_map.len(),
+                saved_uid_present = uid.is_some(),
+                "persisted controller state loaded"
+            );
+
+            Ok::<_, AppError>((hardware, usb_map, gen5_map, uid))
+        })
+        .await
+        .map_err(|error| AppError::Msg(format!("state-loading worker failed: {error}")))??;
+
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(20))
+            .build()
+            .map_err(|error| {
+                AppError::Msg(format!("HTTP client initialization failed: {error}"))
+            })?;
 
         let state = Arc::new(Self {
             cfg,
             controller: RwLock::new(ControllerInfo {
-                board_mac,
-                board_ip,
+                board_mac: board_mac.clone(),
+                board_ip: board_ip.clone(),
                 uid,
             }),
-            usb_map: RwLock::new(HashMap::new()),
-            gen5_map: RwLock::new(HashMap::new()),
+            usb_map: RwLock::new(usb_map),
+            gen5_map: RwLock::new(gen5_map),
             rtos_sessions: Mutex::new(HashMap::new()),
             relay: RelayController::new(),
             reboot: RwLock::new(false),
-            client: reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(15))
-                .timeout(std::time::Duration::from_secs(20))
-                .build()
-                .map_err(|e| AppError::Msg(format!("HTTP client initialization failed: {e}")))?,
-            hardware,
-            jobs: crate::jobs::Jobs::default(),
+            client,
+            jobs: Jobs::default(),
             api_token,
+            hardware,
         });
 
-        state.load_usb_mapping_file().await?;
-        state.load_gen5_mapping_file().await?;
+        tracing::info!(
+            board_mac = %board_mac,
+            board_ip = %board_ip,
+            controller_uid = ?state.controller.blocking_read().uid,
+            "controller application state initialized"
+        );
+
         Ok(state)
     }
 
     pub async fn save_uid(&self, uid: &str) -> AppResult<()> {
-        fs::write(UID_FILE, uid).map_err(AppError::Io)?;
-        self.controller.write().await.uid = Some(uid.to_string());
+        store::validate_uid(uid)?;
+        let mut controller = self.controller.write().await;
+
+        // No .await between commit and publication.
+        store::atomic_replace(Path::new(UID_FILE), uid.as_bytes())?;
+        controller.uid = Some(uid.to_owned());
+
         Ok(())
     }
 
     pub async fn clear_uid(&self) -> AppResult<()> {
         let mut controller = self.controller.write().await;
 
-        match tokio::fs::remove_file(UID_FILE).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(AppError::Io(error)),
-        }
-
+        store::remove_committed(Path::new(UID_FILE))?;
         controller.uid = None;
+
         Ok(())
     }
 
-    pub async fn registration_payload(
-        &self,
-        relays: Vec<crate::models::RelayInventory>,
-    ) -> RegistrationPayload {
-        let c = self.controller.read().await;
+    pub async fn registration_payload(&self, relays: Vec<RelayInventory>) -> RegistrationPayload {
+        let controller = self.controller.read().await;
+
         RegistrationPayload {
-            mac_address: c.board_mac.clone(),
-            ip_address: c.board_ip.clone(),
+            mac_address: controller.board_mac.clone(),
+            ip_address: controller.board_ip.clone(),
             device_family: format!("Gen{}", self.cfg.gen.as_int()),
             relays,
-            uid: c.uid.clone(),
+            uid: controller.uid.clone(),
         }
-    }
-
-    pub(crate) async fn load_usb_mapping_file(&self) -> AppResult<()> {
-        let text = fs::read_to_string(USB_MAPPING_FILE).unwrap_or_default();
-        let mut map = self.usb_map.write().await;
-        map.clear();
-
-        for line in text.lines() {
-            let parts: Vec<_> = line.split(',').map(str::trim).collect();
-            if parts.len() == 4 {
-                let tty = parts[0].to_string();
-                let mac = normalize_mac(parts[1]);
-                let serial = parts[2].to_string();
-                let channel = parts[3].parse::<u8>().unwrap_or(0);
-                map.insert((mac, serial, channel), tty);
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn load_gen5_mapping_file(&self) -> AppResult<()> {
-        let text = fs::read_to_string(GEN5_MAPPING_FILE).unwrap_or_default();
-        let mut map = self.gen5_map.write().await;
-        map.clear();
-
-        for line in text.lines() {
-            let parts: Vec<_> = line.split(',').map(str::trim).collect();
-            if parts.len() == 3 {
-                map.insert(
-                    normalize_mac(parts[2]),
-                    Gen5MapEntry {
-                        uart: parts[0].to_string(),
-                        power: parts[1].to_string(),
-                        mac: normalize_mac(parts[2]),
-                    },
-                );
-            }
-        }
-        Ok(())
     }
 }
 
-pub fn normalize_mac(s: &str) -> String {
-    s.to_ascii_lowercase()
+/// Legacy normalization helper, retained for existing internal callers.
+///
+/// External values should use store::checked_mac instead. Keeping this helper in
+/// the state module documents the earlier normalization contract while avoiding
+/// new call sites that might reintroduce inconsistent MAC parsing.
+#[allow(dead_code)]
+pub fn normalize_mac(value: &str) -> String {
+    value
+        .to_ascii_lowercase()
         .chars()
-        .filter(|c| *c != ':' && *c != '-' && *c != ' ')
+        .filter(|character| !matches!(character, ':' | '-' | ' '))
         .collect()
 }

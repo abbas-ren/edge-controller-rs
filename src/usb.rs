@@ -20,6 +20,10 @@ use std::{
 };
 
 #[derive(Debug, Clone)]
+// Legacy helper kept to document the earlier mapping format. The runtime now
+// persists the same information in the board-specific map types, but this record
+// shape remains useful when comparing historical CSV layouts.
+#[allow(dead_code)]
 pub struct UsbMapEntry {
     pub tty: String,
     pub mac: String,
@@ -78,6 +82,11 @@ pub struct UsbTty {
     pub interface: u8,
 
     /// Canonical sysfs USB-device location, useful for diagnostics.
+    ///
+    /// This is intentionally kept even when the field is not used directly in the
+    /// active runtime; it helps explain how a tty node was resolved during USB
+    /// discovery and makes debugging hotplug problems much easier.
+    #[allow(dead_code)]
     pub topology: PathBuf,
 }
 

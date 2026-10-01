@@ -5,12 +5,11 @@
 
 use crate::{
     error::{AppError, AppResult},
-    state::normalize_mac,
     usb::{self, UsbIdentity},
 };
 
 use serde::Deserialize;
-use std::{collections::HashSet, fs::File, io::Read};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -39,16 +38,11 @@ pub struct HardwarePolicy {
 
 impl HardwarePolicy {
     pub fn load(path: &str) -> AppResult<Self> {
-        let mut bytes = Vec::new();
-        File::open(path)?
-            .take(64 * 1024 + 1)
-            .read_to_end(&mut bytes)?;
+        let text = crate::store::read_required_text(std::path::Path::new(path), 64 * 1024)?;
 
-        if bytes.len() > 64 * 1024 {
-            return Err(AppError::Msg("hardware policy exceeds 64 KiB".into()));
-        }
+        let mut policy: Self = serde_json::from_str(&text)
+            .map_err(|error| AppError::Msg(format!("invalid hardware policy {path}: {error}")))?;
 
-        let mut policy: Self = serde_json::from_slice(&bytes)?;
         policy.validate()?;
         Ok(policy)
     }
@@ -59,8 +53,10 @@ impl HardwarePolicy {
         let mut relay_channels = HashSet::new();
         let mut gpios = HashSet::new();
 
+        tracing::info!(board_count = self.boards.len(), "validating hardware policy bindings");
+
         for board in &mut self.boards {
-            board.mac = normalize_mac(&board.mac);
+            board.mac = crate::store::checked_mac(&board.mac)?;
 
             if board.mac.len() != 12
                 || !board.mac.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -106,11 +102,9 @@ impl HardwarePolicy {
                         AppError::Msg("Gen3/Gen4 board requires relay binding".into())
                     })?;
 
-                    if relay.serial.is_empty()
-                        || relay.serial.len() > 255
-                        || relay.serial.contains(',')
-                        || relay.serial.chars().any(char::is_control)
-                        || relay.channel > 7
+                    crate::store::validate_serial(&relay.serial)?;
+
+                    if relay.channel > 7
                         || !relay_channels.insert((relay.serial.clone(), relay.channel))
                     {
                         return Err(AppError::Msg(
@@ -152,13 +146,23 @@ impl HardwarePolicy {
                     }
                 }
             }
+
+            tracing::debug!(
+                mac = %board.mac,
+                generation = board.gen,
+                uart = ?board.uart,
+                relay = ?board.relay,
+                power = ?board.power,
+                "board binding validated"
+            );
         }
 
+        tracing::info!(approved_boards = self.boards.len(), "hardware policy validation succeeded");
         Ok(())
     }
 
     pub fn board(&self, mac: &str, generation: u8) -> AppResult<&BoardBinding> {
-        let mac = normalize_mac(mac);
+        let mac = crate::store::checked_mac(mac)?;
 
         self.boards
             .iter()

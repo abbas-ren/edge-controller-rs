@@ -132,6 +132,8 @@ async fn connection_session(
                     return Ok(());
                 }
 
+                // A missed heartbeat usually means the peer is unreachable or the
+                // socket is half-dead; treat that as a terminal session problem.
                 if last_pong.elapsed() > PONG_TIMEOUT {
                     return Err(AppError::Msg(
                         "WebSocket pong deadline exceeded".into(),
@@ -140,8 +142,11 @@ async fn connection_session(
             }
 
             _ = heartbeat.tick() => {
-                // Send ping independently of metrics availability.
-                send(&mut socket, Message::Ping(Vec::new().into())).await?;
+                // Send a keepalive on a fixed cadence so the upstream backend can
+                // confirm that the controller is still alive and responsive.
+                let ping_payload = Vec::new();
+                debug!("sending WebSocket ping heartbeat");
+                send(&mut socket, Message::Ping(ping_payload.into())).await?;
 
                 let ip = state.controller.read().await.board_ip.clone();
                 let uid = uid.to_owned();
@@ -162,6 +167,7 @@ async fn connection_session(
                 match sampled {
                     Ok(payload) => {
                         let bytes = serde_json::to_vec(&payload)?;
+                        debug!(bytes = bytes.len(), "sending heartbeat metrics payload");
                         send(&mut socket, Message::Binary(bytes.into())).await?;
                     }
                     Err(error) => {
@@ -174,24 +180,17 @@ async fn connection_session(
 
             incoming = socket.next() => {
                 match incoming {
-                    Some(Ok(Message::Pong(_))) => {
+                    Some(Ok(Message::Pong(data))) => {
                         last_pong = Instant::now();
+                        debug!(bytes = data.len(), "received WebSocket pong");
                     }
 
-                    Some(Ok(Message::Ping(_))) => {
-                        // Tungstenite automatically queues a matching Pong
-                        // when it reads Ping. Flush that queued response;
-                        // do not send a duplicate explicit Pong.
-                        time::timeout(WRITE_TIMEOUT, socket.flush())
-                            .await
-                            .map_err(|_| {
-                                AppError::Msg("WebSocket pong flush timed out".into())
-                            })?
-                            .map_err(|error| {
-                                AppError::Msg(format!(
-                                    "WebSocket pong flush failed: {error}"
-                                ))
-                            })?;
+                    Some(Ok(Message::Ping(data))) => {
+                        // Respond immediately to a ping. The peer must see a pong to
+                        // consider the socket healthy; simply flushing is not enough.
+                        debug!(bytes = data.len(), "received WebSocket ping; replying with pong");
+                        send(&mut socket, Message::Pong(data)).await?;
+                        last_pong = Instant::now();
                     }
 
                     Some(Ok(Message::Text(message))) => {
@@ -210,11 +209,7 @@ async fn connection_session(
                     }
 
                     Some(Ok(Message::Close(_))) => {
-                        let _ = time::timeout(
-                            WRITE_TIMEOUT,
-                            socket.flush(),
-                        ).await;
-
+                        info!("backend requested WebSocket close");
                         return Ok(());
                     }
 
@@ -226,7 +221,10 @@ async fn connection_session(
                         )));
                     }
 
-                    None => return Ok(()),
+                    None => {
+                        info!("WebSocket stream ended; reconnecting");
+                        return Ok(());
+                    }
                 }
             }
         }

@@ -193,6 +193,8 @@ impl RelayController {
     pub fn set_channel(&self, serial: &str, channel: u8, on: bool) -> AppResult<()> {
         Self::validate_channel(channel)?;
 
+        tracing::debug!(%serial, channel, on, "attempting relay channel update");
+
         // Hold the lock across discovery, configuration, read, and write.
         // Otherwise two concurrent updates could overwrite each other.
         let _guard = lock_relays()?;
@@ -211,6 +213,7 @@ impl RelayController {
             on,
             "relay command transferred"
         );
+        tracing::debug!(previous_state = current, updated_state = updated, "relay bitmask updated");
 
         // This confirms the USB transfer, not mechanical contact closure.
         Ok(())
@@ -234,6 +237,8 @@ impl RelayController {
     /// Device failures are logged and omitted from the inventory. An empty
     /// result means "no readable relays", not necessarily "none attached".
     pub fn inventory(&self) -> Vec<RelayInventory> {
+        tracing::debug!("enumerating relay inventory");
+
         let _guard = match lock_relays() {
             Ok(guard) => guard,
             Err(error) => {
@@ -326,6 +331,7 @@ impl RelayController {
 
         inventory.sort_unstable_by(|left, right| left.serial_number.cmp(&right.serial_number));
 
+        tracing::info!(relay_count = inventory.len(), "relay inventory discovered");
         inventory
     }
 }
