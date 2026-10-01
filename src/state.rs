@@ -118,10 +118,12 @@ impl AppState {
             hardware,
         });
 
+        let controller_uid = state.controller.read().await.uid.clone();
+
         tracing::info!(
             board_mac = %board_mac,
             board_ip = %board_ip,
-            controller_uid = ?state.controller.blocking_read().uid,
+            controller_uid = ?controller_uid,
             "controller application state initialized"
         );
 

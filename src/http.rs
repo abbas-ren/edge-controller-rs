@@ -1,6 +1,6 @@
 use crate::{jobs::Lease, state::RtosSession};
 use axum::{
-    body::Body,
+    body::{to_bytes, Body},
     extract::{Extension, State},
     http::{header, Request, StatusCode},
     middleware::{self, Next},
@@ -20,7 +20,7 @@ use std::{
     time::Duration,
 };
 use tokio::task;
-use tracing::{error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::store::{Gen5Mappings, UsbMappings};
 use crate::{
@@ -70,7 +70,66 @@ async fn request_guard(
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
-    tracing::debug!(path = %request.uri(), "HTTP request entering request guard");
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let query = request.uri().query().map(str::to_owned);
+    let content_type = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+
+    let body_for_logging = std::mem::take(request.body_mut());
+    let payload = match to_bytes(body_for_logging, 64 * 1024).await {
+        Ok(bytes) => {
+            if !bytes.is_empty() {
+                *request.body_mut() = Body::from(bytes.clone());
+                Some(bytes)
+            } else {
+                None
+            }
+        }
+        Err(error) => {
+            warn!(%method, %path, %error, "failed to read request body for API logging");
+            None
+        }
+    };
+
+    match payload {
+        Some(body) => {
+            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) {
+                info!(
+                    method = %method,
+                    path = %path,
+                    query = ?query,
+                    content_type = ?content_type,
+                    payload = ?json,
+                    "router API request received"
+                );
+            } else {
+                let preview = String::from_utf8_lossy(&body);
+                info!(
+                    method = %method,
+                    path = %path,
+                    query = ?query,
+                    content_type = ?content_type,
+                    payload_preview = %preview,
+                    "router API request received"
+                );
+            }
+        }
+        None => {
+            info!(
+                method = %method,
+                path = %path,
+                query = ?query,
+                content_type = ?content_type,
+                "router API request received without a body"
+            );
+        }
+    }
+
+    debug!(path = %request.uri(), "HTTP request entering request guard");
 
     if let Some(expected) = state.api_token.as_deref() {
         let supplied = request
@@ -530,6 +589,12 @@ fn error_response(message: impl AsRef<str>, status: StatusCode) -> Response {
         .into_response()
 }
 
+macro_rules! log_handler_request {
+    ($handler:literal, $request:expr) => {
+        info!(handler = $handler, request = ?$request, "API handler invoked");
+    };
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/confirmation", post(confirmation))
@@ -741,6 +806,8 @@ async fn ipl_run(
     Extension(lease): Extension<Lease>,
     Json(request): Json<IplRequest>,
 ) -> Response {
+    log_handler_request!("ipl_run", &request);
+
     let prepared = match prepare_flash(&state, request).await {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -762,6 +829,8 @@ async fn ipl_run(
             error!(%error, "IPL job failed");
         }
     });
+
+    info!(handler = "ipl_run", status = %StatusCode::ACCEPTED, "IPL request accepted for processing");
 
     (
         StatusCode::ACCEPTED,
@@ -819,6 +888,7 @@ async fn ipl_mode(
     Extension(lease): Extension<Lease>,
     Json(request): Json<IplModeRequest>,
 ) -> Response {
+    log_handler_request!("ipl_mode", &request);
     execute_ipl_mode(state, lease, request, true).await
 }
 
@@ -827,6 +897,7 @@ async fn ipl_mode_default(
     Extension(lease): Extension<Lease>,
     Json(request): Json<IplModeRequest>,
 ) -> Response {
+    log_handler_request!("ipl_mode_default", &request);
     execute_ipl_mode(state, lease, request, false).await
 }
 
@@ -840,6 +911,8 @@ async fn reboot_device(
     Extension(lease): Extension<Lease>,
     Json(request): Json<RebootDeviceRequest>,
 ) -> Response {
+    log_handler_request!("reboot_device", &request);
+
     let power = match mapped_power_tty(&state, &request.power).await {
         Ok(power) => power,
         Err(error) => {
@@ -865,7 +938,10 @@ async fn reboot_device(
     .await;
 
     match result {
-        Ok(Ok(())) => ok().into_response(),
+        Ok(Ok(())) => {
+            info!(handler = "reboot_device", status = %StatusCode::OK, "device reboot command completed");
+            ok().into_response()
+        }
         Ok(Err(error)) => error_response(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
         Err(error) => error_response(
             format!("reboot worker failed: {error}"),
@@ -878,12 +954,17 @@ async fn confirmation(
     State(state): State<Arc<AppState>>,
     Json(request): Json<ConfirmationRequest>,
 ) -> Response {
+    log_handler_request!("confirmation", &request);
+
     if let Err(error) = crate::store::validate_uid(&request.controller_id) {
         return error_response(error.to_string(), StatusCode::BAD_REQUEST);
     }
 
     match state.save_uid(&request.controller_id).await {
-        Ok(()) => ok().into_response(),
+        Ok(()) => {
+            info!(handler = "confirmation", status = %StatusCode::OK, "controller confirmation processed");
+            ok().into_response()
+        }
         Err(error) => error_response(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
@@ -956,6 +1037,8 @@ async fn devcon_delete(
     State(state): State<Arc<AppState>>,
     Json(request): Json<DeleteRequest>,
 ) -> Response {
+    log_handler_request!("devcon_delete", &request);
+
     let Some(generation) = Generation::from_int(request.gen) else {
         return error_response("invalid generation", StatusCode::BAD_REQUEST);
     };
@@ -1019,6 +1102,7 @@ async fn devcon_delete(
         *state.reboot.write().await = true;
     }
 
+    info!(handler = "devcon_delete", status = %StatusCode::OK, "device mapping deletion completed");
     ok().into_response()
 }
 
@@ -1026,6 +1110,8 @@ async fn relay_delete(
     State(state): State<Arc<AppState>>,
     Json(request): Json<DeleteRequest>,
 ) -> Response {
+    log_handler_request!("relay_delete", &request);
+
     let Some(generation @ (Generation::Gen3 | Generation::Gen4)) =
         Generation::from_int(request.gen)
     else {
@@ -1055,7 +1141,10 @@ async fn relay_delete(
     .await;
 
     match result {
-        Ok(Ok(())) => ok().into_response(),
+        Ok(Ok(())) => {
+            info!(handler = "relay_delete", status = %StatusCode::OK, "relay mapping deletion completed");
+            ok().into_response()
+        }
         Ok(Err(error)) => error_response(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
         Err(error) => error_response(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
     }
@@ -1065,9 +1154,12 @@ async fn gen5_tty_entry(
     State(state): State<Arc<AppState>>,
     Json(req): Json<Gen5TtyRequest>,
 ) -> impl IntoResponse {
+    log_handler_request!("gen5_tty_entry", &req);
+
     match resolve_gen5_mapping_sync(state.clone(), &req.mac) {
         Ok(Some((uart, power))) => {
             let body = serde_json::json!({ "uart": uart, "power": power });
+            info!(handler = "gen5_tty_entry", uart = %uart, power = %power, "Gen5 TTY mapping resolved");
             let _ = notify_gen5_mapping(&state, &req.mac, Some(&body)).await;
             Response::builder()
                 .status(StatusCode::OK)
@@ -1088,6 +1180,8 @@ async fn relay(
     Extension(lease): Extension<Lease>,
     Json(request): Json<RelayRequest>,
 ) -> Response {
+    log_handler_request!("relay", &request);
+
     if request.channel > 7 {
         return error_response("relay channel must be 0..7", StatusCode::BAD_REQUEST);
     }
@@ -1113,6 +1207,10 @@ async fn relay(
         );
     }
 
+    let relay_serial = request.serial.clone();
+    let relay_state = request.state.clone();
+    let relay_channel = request.channel;
+
     let result = task::spawn_blocking(move || {
         let _lease = lease;
         state
@@ -1122,7 +1220,10 @@ async fn relay(
     .await;
 
     match result {
-        Ok(Ok(())) => ok().into_response(),
+        Ok(Ok(())) => {
+            info!(handler = "relay", serial = %relay_serial, channel = relay_channel, state = %relay_state, "relay state change applied");
+            ok().into_response()
+        }
         Ok(Err(error)) => error_response(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
         Err(error) => error_response(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
     }
@@ -1133,6 +1234,8 @@ async fn relay_status(
     Extension(lease): Extension<Lease>,
     Json(request): Json<RelayStatusRequest>,
 ) -> Response {
+    log_handler_request!("relay_status", &request);
+
     if request.channel > 7 {
         return error_response("relay channel must be 0..7", StatusCode::BAD_REQUEST);
     }
@@ -1151,6 +1254,9 @@ async fn relay_status(
         );
     }
 
+    let relay_serial = request.serial.clone();
+    let relay_channel = request.channel;
+
     let result = task::spawn_blocking(move || {
         let _lease = lease;
         state.relay.channel_status(&request.serial, request.channel)
@@ -1158,7 +1264,10 @@ async fn relay_status(
     .await;
 
     match result {
-        Ok(Ok(value)) => Json(serde_json::json!({ "state": value })).into_response(),
+        Ok(Ok(value)) => {
+            info!(handler = "relay_status", serial = %relay_serial, channel = relay_channel, state = value, "relay status retrieved");
+            Json(serde_json::json!({ "state": value })).into_response()
+        }
         Ok(Err(error)) => error_response(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
         Err(error) => error_response(
             format!("relay status worker failed: {error}"),
@@ -1171,6 +1280,8 @@ async fn relay_config(
     State(state): State<Arc<AppState>>,
     Json(request): Json<RelayConfigRequest>,
 ) -> Response {
+    log_handler_request!("relay_config", &request);
+
     let Some(generation) = Generation::from_int(request.gen) else {
         return error_response("invalid generation", StatusCode::BAD_REQUEST);
     };
@@ -1197,6 +1308,7 @@ async fn relay_config(
     let _ = notify_relay_config(&state, &request.mac, success).await;
 
     if success {
+        info!(handler = "relay_config", mac = %request.mac, serial = %request.serial, channel = request.channel, generation = request.gen, "relay configuration persisted");
         ok().into_response()
     } else {
         error_response(
@@ -1246,6 +1358,8 @@ async fn gen5_power(
     Extension(lease): Extension<Lease>,
     Json(request): Json<Gen5PowerRequest>,
 ) -> Response {
+    log_handler_request!("gen5_power", &request);
+
     let on = match parse_power_state(&request.state) {
         Ok(on) => on,
         Err(error) => {
@@ -1268,7 +1382,10 @@ async fn gen5_power(
     .await;
 
     match result {
-        Ok(Ok(())) => ok().into_response(),
+        Ok(Ok(())) => {
+            info!(handler = "gen5_power", power = %request.power, state = %request.state, "Gen5 power transaction completed");
+            ok().into_response()
+        }
         Ok(Err(error)) => error_response(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
         Err(error) => error_response(
             format!("power-control worker failed: {error}"),
@@ -1281,6 +1398,8 @@ async fn mapping_entry(
     State(_state): State<Arc<AppState>>,
     Json(request): Json<MappingEntryRequest>,
 ) -> Response {
+    log_handler_request!("mapping_entry", &request);
+
     if request.gen != 5 {
         return error_response(
             "TTY inventory discovery requires gen 5",
@@ -1295,11 +1414,14 @@ async fn mapping_entry(
     .await;
 
     match result {
-        Ok(Ok((uart, power))) => Json(serde_json::json!({
-            "uart": uart,
-            "power": power,
-        }))
-        .into_response(),
+        Ok(Ok((uart, power))) => {
+            info!(handler = "mapping_entry", uart = ?uart, power = ?power, "Gen5 mapping entry discovered");
+            Json(serde_json::json!({
+                "uart": uart,
+                "power": power,
+            }))
+            .into_response()
+        }
         Ok(Err(error)) => error_response(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
         Err(error) => error_response(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
     }
@@ -1309,6 +1431,8 @@ async fn ipl_remove(
     State(_state): State<Arc<AppState>>,
     Json(request): Json<RemoveIplRequest>,
 ) -> Response {
+    log_handler_request!("ipl_remove", &request);
+
     let result = task::spawn_blocking(move || -> crate::error::AppResult<()> {
         use crate::error::AppError;
         use std::path::Component;
@@ -1447,6 +1571,8 @@ async fn rtos_start(
     State(state): State<Arc<AppState>>,
     Json(request): Json<RtosStartRequest>,
 ) -> Response {
+    log_handler_request!("rtos_start", &request);
+
     let session_key = match request.mac.as_deref().map(validated_mac).transpose() {
         Ok(Some(mac)) => mac,
         Ok(None) => {
@@ -1561,6 +1687,9 @@ async fn rtos_start(
         Ok(())
     });
 
+    let session_key_for_log = session_key.clone();
+    let tty_for_log = tty.clone();
+
     sessions.insert(
         session_key,
         RtosSession {
@@ -1571,6 +1700,7 @@ async fn rtos_start(
         },
     );
 
+    info!(handler = "rtos_start", mac = %session_key_for_log, tty = %tty_for_log, "RTOS capture started");
     ok().into_response()
 }
 
@@ -1578,6 +1708,8 @@ async fn rtos_end(
     State(state): State<Arc<AppState>>,
     Json(request): Json<RtosEndRequest>,
 ) -> Response {
+    log_handler_request!("rtos_end", &request);
+
     let session_key = match request.mac.as_deref().map(validated_mac).transpose() {
         Ok(Some(mac)) => mac,
         Ok(None) => {
@@ -1630,6 +1762,8 @@ async fn rtos_end(
     drop(sessions);
 
     let stream = tokio_util::io::ReaderStream::new(file);
+
+    info!(handler = "rtos_end", mac = %session_key, capture_status = %capture_status, "RTOS capture stop requested and download prepared");
 
     (
         [
