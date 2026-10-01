@@ -82,6 +82,7 @@ impl HardwarePolicy {
                     pid = identity.pid,
                     serial = %identity.serial,
                     interface = identity.interface,
+                    path = ?identity.path,
                     "validating USB identity against the hardware policy"
                 );
 
@@ -93,7 +94,15 @@ impl HardwarePolicy {
                     ));
                 }
 
-                if !identities.insert(identity.clone()) {
+                let key = (
+                    identity.vid,
+                    identity.pid,
+                    identity.serial.clone(),
+                    identity.interface,
+                    identity.path.clone(),
+                );
+
+                if !identities.insert(key) {
                     return Err(AppError::Msg(
                         "one USB interface is assigned to multiple hardware roles".into(),
                     ));

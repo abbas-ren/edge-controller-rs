@@ -49,6 +49,17 @@ pub struct UsbIdentity {
     pub pid: u16,
     pub serial: String,
     pub interface: u8,
+
+    /// Optional USB topology hint used when multiple devices share the same
+    /// VID/PID/serial string behind a single hub or bridge.
+    ///
+    /// The value is matched against the canonical sysfs topology suffix, for
+    /// example `1-2.3` or a longer path suffix such as
+    /// `usb1/1-2/1-2.3`. This keeps the legacy identity format working while
+    /// allowing the hardware policy to disambiguate identical serials in the
+    /// real world.
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 impl UsbIdentity {
@@ -62,7 +73,34 @@ impl UsbIdentity {
             ));
         }
 
+        if let Some(path) = &self.path {
+            let trimmed = path.trim();
+            if trimmed.is_empty() || trimmed.contains('\0') || trimmed.chars().any(char::is_control)
+            {
+                return Err(AppError::Msg(
+                    "USB topology path must be a nonempty, non-control sysfs suffix".into(),
+                ));
+            }
+        }
+
         Ok(())
+    }
+
+    fn path_matches(&self, device: &UsbTty) -> bool {
+        let Some(path) = &self.path else {
+            return true;
+        };
+
+        let suffix = path.trim();
+        if suffix.is_empty() {
+            return true;
+        }
+
+        let topology = device.topology.to_string_lossy();
+        let normalized = suffix.strip_prefix('/').unwrap_or(suffix);
+        let with_leading = format!("/{normalized}");
+
+        topology.ends_with(normalized) || topology.ends_with(&with_leading)
     }
 
     pub fn matches(&self, device: &UsbTty) -> bool {
@@ -70,6 +108,7 @@ impl UsbIdentity {
             && device.pid == self.pid
             && device.serial.as_deref() == Some(self.serial.as_str())
             && device.interface == self.interface
+            && self.path_matches(device)
     }
 }
 
@@ -255,8 +294,13 @@ fn select_identity(devices: &[UsbTty], identity: &UsbIdentity) -> AppResult<Stri
         .iter()
         .map(|device| {
             format!(
-                "tty={} vid={:04x} pid={:04x} serial={:?} interface={}",
-                device.tty, device.vid, device.pid, device.serial, device.interface
+                "tty={} vid={:04x} pid={:04x} serial={:?} interface={} path={}",
+                device.tty,
+                device.vid,
+                device.pid,
+                device.serial,
+                device.interface,
+                device.topology.display()
             )
         })
         .collect::<Vec<_>>();
@@ -266,6 +310,7 @@ fn select_identity(devices: &[UsbTty], identity: &UsbIdentity) -> AppResult<Stri
         requested_pid = identity.pid,
         requested_serial = %identity.serial,
         requested_interface = identity.interface,
+        requested_path = ?identity.path,
         device_count = devices.len(),
         available_devices = ?available,
         "checking live USB inventory against the requested USB identity"
@@ -415,6 +460,7 @@ mod tests {
             pid: 0x6010,
             serial: serial.into(),
             interface,
+            path: None,
         }
     }
 
@@ -452,7 +498,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_usb_serial_identity_is_rejected() {
+    fn duplicate_usb_serial_identity_is_rejected_without_path_hint() {
         let temp = tempfile::tempdir().unwrap();
         fake_tty(temp.path(), "ttyUSB0", "1-2", 0, "DUPLICATE");
         fake_tty(temp.path(), "ttyUSB1", "1-3", 0, "DUPLICATE");
@@ -460,6 +506,25 @@ mod tests {
         let devices = scan_at(&temp.path().join("class/tty"), Path::new("/dev")).unwrap();
 
         assert!(select_identity(&devices, &identity("DUPLICATE", 0)).is_err());
+    }
+
+    #[test]
+    fn duplicate_usb_serial_identity_can_be_resolved_by_topology_path() {
+        let temp = tempfile::tempdir().unwrap();
+        fake_tty(temp.path(), "ttyUSB0", "1-2.3", 0, "DUPLICATE");
+        fake_tty(temp.path(), "ttyUSB1", "1-2.4", 0, "DUPLICATE");
+
+        let devices = scan_at(&temp.path().join("class/tty"), Path::new("/dev")).unwrap();
+
+        let target = UsbIdentity {
+            vid: 0x0403,
+            pid: 0x6010,
+            serial: "DUPLICATE".into(),
+            interface: 0,
+            path: Some("1-2.3".into()),
+        };
+
+        assert_eq!(select_identity(&devices, &target).unwrap(), "/dev/ttyUSB0");
     }
 
     #[test]
