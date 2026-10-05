@@ -59,6 +59,8 @@ async fn main() -> Result<()> {
         metrics_port,
         bind_port,
         features,
+        relay_serial_number,
+        vid_pid,
     ) = match cli {
         Cli::Help => {
             print!("{}", Cli::help_text()?);
@@ -74,6 +76,8 @@ async fn main() -> Result<()> {
             metrics_port,
             bind_port,
             features,
+            relay_serial_number,
+            vid_pid,
         } => (
             config_path,
             check_only,
@@ -84,6 +88,8 @@ async fn main() -> Result<()> {
             metrics_port,
             bind_port,
             features,
+            relay_serial_number,
+            vid_pid,
         ),
     };
 
@@ -187,7 +193,20 @@ async fn main() -> Result<()> {
         "controller identity loaded"
     );
 
-    let state = AppState::new(cfg, mac, ip, features)
+    if relay_serial_number.is_some() && vid_pid.is_none() {
+        return Err(anyhow!(
+            "--relay-serial-number requires the corresponding --vid-pid"
+        ));
+    }
+    if (features.gen3 || features.gen4) && vid_pid.is_none() {
+        return Err(anyhow!("Gen3/Gen4 requires --vid-pid"));
+    }
+    let relay_selector = vid_pid.map(|vid_pid| relay::RelaySelector {
+        serial_number: relay_serial_number,
+        vid_pid: Some(vid_pid),
+    });
+
+    let state = AppState::new(cfg, mac, ip, features, relay_selector)
         .await
         .context("initializing controller state")?;
 

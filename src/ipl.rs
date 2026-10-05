@@ -6,6 +6,7 @@
 use crate::{
     error::{AppError, AppResult},
     gpio::GpioController,
+    models::VoltageLevel,
     observability::metrics::global_metrics,
     state::AppState,
     uart::Console,
@@ -98,8 +99,9 @@ pub struct FlashWriterTarget {
     pub mac: String,
     pub serial: String,
     pub channel: u8,
-    pub gpio1: u32,
-    pub gpio2: u32,
+    pub gpio: u32,
+    pub gpio_default_level: VoltageLevel,
+    pub relay_default_level: VoltageLevel,
 }
 
 pub struct Gen5Job {
@@ -186,23 +188,45 @@ fn seconds(value: u64) -> Duration {
     Duration::from_secs(value)
 }
 
-/// Change boot straps while power is off.
+/// Apply resting levels or assert the ordered relay/GPIO download pulse.
 ///
 /// This deliberately leaves the GPIO line request owned by the service.
+fn boot_sequence_levels(
+    gpio_default_level: VoltageLevel,
+    relay_default_level: VoltageLevel,
+    download: bool,
+) -> (VoltageLevel, VoltageLevel, VoltageLevel) {
+    if download {
+        (
+            relay_default_level.inverse(),
+            gpio_default_level.inverse(),
+            relay_default_level,
+        )
+    } else {
+        (relay_default_level, gpio_default_level, relay_default_level)
+    }
+}
+
 fn set_boot_mode(state: &AppState, target: &FlashWriterTarget, download: bool) -> AppResult<()> {
-    state
-        .relay
-        .set_channel(&target.serial, target.channel, false)?;
-
-    std::thread::sleep(seconds(2));
-
-    GpioController::set_pair(target.gpio1, target.gpio2, download)?;
-
-    std::thread::sleep(seconds(2));
+    let (initial_relay, gpio, final_relay) = boot_sequence_levels(
+        target.gpio_default_level,
+        target.relay_default_level,
+        download,
+    );
 
     state
         .relay
-        .set_channel(&target.serial, target.channel, true)
+        .set_channel(&target.serial, target.channel, initial_relay.is_high())?;
+
+    std::thread::sleep(seconds(2));
+
+    GpioController::set(target.gpio, gpio.is_high())?;
+
+    std::thread::sleep(seconds(2));
+
+    state
+        .relay
+        .set_channel(&target.serial, target.channel, final_relay.is_high())
 }
 
 /// Enter SCIF download mode, opening UART before the boot begins.
@@ -507,8 +531,8 @@ pub async fn run_gen5(state: Arc<AppState>, job: Gen5Job) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        completion_endpoint, contains_success_marker, preflight_flashwriter, supports_relay_flash,
-        FLASHWRITER, IMAGES,
+        boot_sequence_levels, completion_endpoint, contains_success_marker, preflight_flashwriter,
+        supports_relay_flash, VoltageLevel, FLASHWRITER, IMAGES,
     };
     use std::{fs, os::unix::fs::symlink};
 
@@ -529,6 +553,18 @@ mod tests {
         assert_eq!(completion_endpoint(3), "flash-confirm-gen4");
         assert_eq!(completion_endpoint(4), "flash-confirm-gen4");
         assert_eq!(completion_endpoint(5), "flash-confirm");
+    }
+
+    #[test]
+    fn low_defaults_preserve_the_download_pulse_and_normal_resting_levels() {
+        assert_eq!(
+            boot_sequence_levels(VoltageLevel::Low, VoltageLevel::Low, true),
+            (VoltageLevel::High, VoltageLevel::High, VoltageLevel::Low)
+        );
+        assert_eq!(
+            boot_sequence_levels(VoltageLevel::Low, VoltageLevel::Low, false),
+            (VoltageLevel::Low, VoltageLevel::Low, VoltageLevel::Low)
+        );
     }
 
     #[test]

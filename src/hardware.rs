@@ -15,7 +15,6 @@ use std::collections::HashSet;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelayBinding {
-    pub serial: String,
     pub channel: u8,
 }
 
@@ -27,7 +26,7 @@ pub struct BoardBinding {
     pub uart: UsbIdentity,
     pub power: Option<UsbIdentity>,
     pub relay: Option<RelayBinding>,
-    pub gpios: Option<[u32; 2]>,
+    pub gpio: Option<u32>,
     pub rtos: Option<UsbIdentity>,
 }
 
@@ -171,18 +170,14 @@ impl HardwarePolicy {
                         AppError::Msg("Gen3/Gen4 board requires relay binding".into())
                     })?;
 
-                    crate::store::validate_serial(&relay.serial)?;
-
-                    if relay.channel > 7
-                        || !relay_channels.insert((relay.serial.clone(), relay.channel))
-                    {
+                    if relay.channel > 7 || !relay_channels.insert(relay.channel) {
                         return Err(AppError::Msg(
                             "invalid or duplicate relay/channel assignment".into(),
                         ));
                     }
                 }
                 5 => {
-                    if board.relay.is_some() || board.gpios.is_some() {
+                    if board.relay.is_some() || board.gpio.is_some() {
                         return Err(AppError::Msg(
                             "Gen5 does not use this service's relay/GPIO binding".into(),
                         ));
@@ -208,11 +203,9 @@ impl HardwarePolicy {
                 _ => unreachable!(),
             }
 
-            if let Some(offsets) = board.gpios {
-                for offset in offsets {
-                    if !gpios.insert(offset) {
-                        return Err(AppError::Msg("GPIO line is assigned more than once".into()));
-                    }
+            if let Some(offset) = board.gpio {
+                if !gpios.insert(offset) {
+                    return Err(AppError::Msg("GPIO line is assigned more than once".into()));
                 }
             }
 
@@ -242,12 +235,12 @@ impl HardwarePolicy {
             .ok_or_else(|| AppError::Msg("board is not approved by hardware policy".into()))
     }
 
-    pub fn relay_allowed(&self, serial: &str, channel: u8) -> bool {
+    pub fn relay_allowed(&self, channel: u8) -> bool {
         self.boards.iter().any(|board| {
             board
                 .relay
                 .as_ref()
-                .is_some_and(|relay| relay.serial == serial && relay.channel == channel)
+                .is_some_and(|relay| relay.channel == channel)
         })
     }
 

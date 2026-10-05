@@ -278,7 +278,7 @@ mod tests {
             usb_map: RwLock::new(HashMap::new()),
             gen5_map: RwLock::new(HashMap::new()),
             rtos_sessions: Mutex::new(HashMap::new()),
-            relay: RelayController::new(),
+            relay: RelayController::new(None).unwrap(),
             deletion_requested: AtomicBool::new(false),
             client: reqwest::Client::new(),
             jobs: Jobs::default(),

@@ -16,10 +16,9 @@
         "interface": 1
       },
       "relay": {
-        "serial": "AB0OFAFX",
         "channel": 1
       },
-      "gpios": [4, 5]
+      "gpio": 4
     },
     {
       "mac": "2e:09:0a:06:d9:8e",
@@ -37,10 +36,9 @@
         "interface": 1
       },
       "relay": {
-        "serial": "AB0OFAFX",
         "channel": 0
       },
-      "gpios": [2, 3]
+      "gpio": 2
     }
   ]
 }

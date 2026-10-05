@@ -128,6 +128,9 @@ pub fn openapi_document() -> serde_json::Value {
             "/relay/status": {
                 "post": post_operation("Read relay channel state", "RelayStatusRequest", "200", "Relay state returned")
             },
+            "/relay/identity": {
+                "post": post_operation("Update active relay USB identity", "RelayIdentityUpdateRequest", "200", "Relay identity updated")
+            },
             "/relay/config": {
                 "post": post_operation("Persist Gen3/Gen4 relay mapping", "RelayConfigRequest", "200", "Mapping persisted")
             },
@@ -209,8 +212,10 @@ pub fn openapi_document() -> serde_json::Value {
                 "DeleteRequest": {"type": "object", "properties": {"gen": {"type": "integer", "enum": [3, 4], "default": 4}, "uid": {"type": "string", "nullable": true}, "mac": {"type": "string", "nullable": true}, "serial": {"type": "string", "nullable": true}, "channel": {"type": "integer", "minimum": 0, "maximum": 7, "nullable": true}}},
                 "MappingEntryRequest": {"type": "object", "required": ["mac", "gen"], "properties": {"mac": {"type": "string"}, "gen": {"type": "integer", "enum": [5]}}},
                 "RebootDeviceRequest": {"type": "object", "required": ["power"], "properties": {"power": {"type": "string"}}},
-                "IplRequest": {"type": "object", "required": ["gen"], "properties": {"gen": {"type": "integer", "enum": [3, 4, 5]}, "gpio1": {"type": "integer", "nullable": true}, "gpio2": {"type": "integer", "nullable": true}, "mac": {"type": "string", "nullable": true}, "serial": {"type": "string", "nullable": true}, "channel": {"type": "integer", "minimum": 0, "maximum": 7, "nullable": true}, "path": {"type": "string", "nullable": true}, "uart": {"type": "string", "nullable": true}, "power": {"type": "string", "nullable": true}, "sdk_ver": {"type": "string", "nullable": true}}},
-                "IplModeRequest": {"type": "object", "required": ["gpio1", "gpio2", "mac", "serial", "channel"], "properties": {"gpio1": {"type": "integer"}, "gpio2": {"type": "integer"}, "mac": {"type": "string"}, "serial": {"type": "string"}, "channel": {"type": "integer", "minimum": 0, "maximum": 7}}},
+                "VoltageLevel": {"type": "string", "enum": ["HIGH", "LOW"]},
+                "RelayIdentityUpdateRequest": {"type": "object", "required": ["vidPid"], "properties": {"serialNumber": {"type": "string", "nullable": true}, "vidPid": {"type": "string", "pattern": "^[0-9A-Fa-f]{4}:[0-9A-Fa-f]{4}$"}}},
+                "IplRequest": {"type": "object", "required": ["gen"], "properties": {"gen": {"type": "integer", "enum": [3, 4, 5]}, "gpio": {"type": "integer", "nullable": true}, "gpioDefaultLevel": {"allOf": [{"$ref": "#/components/schemas/VoltageLevel"}], "default": "LOW", "nullable": true}, "relayDefaultLevel": {"allOf": [{"$ref": "#/components/schemas/VoltageLevel"}], "default": "LOW", "nullable": true}, "mac": {"type": "string", "nullable": true}, "serial": {"type": "string", "nullable": true}, "channel": {"type": "integer", "minimum": 0, "maximum": 7, "nullable": true}, "path": {"type": "string", "nullable": true}, "uart": {"type": "string", "nullable": true}, "power": {"type": "string", "nullable": true}, "sdk_ver": {"type": "string", "nullable": true}}},
+                "IplModeRequest": {"type": "object", "required": ["gpio", "mac", "serial", "channel"], "properties": {"gpio": {"type": "integer"}, "gpioDefaultLevel": {"allOf": [{"$ref": "#/components/schemas/VoltageLevel"}], "default": "LOW"}, "relayDefaultLevel": {"allOf": [{"$ref": "#/components/schemas/VoltageLevel"}], "default": "LOW"}, "mac": {"type": "string"}, "serial": {"type": "string"}, "channel": {"type": "integer", "minimum": 0, "maximum": 7}}},
                 "RemoveIplRequest": {"type": "object", "required": ["path"], "properties": {"path": {"type": "string"}}},
                 "Gen5TtyRequest": {"type": "object", "required": ["mac"], "properties": {"mac": {"type": "string"}}},
                 "Gen5PowerRequest": {"type": "object", "required": ["state", "power"], "properties": {"state": {"type": "string", "enum": ["on", "off"]}, "power": {"type": "string"}}},
@@ -299,6 +304,7 @@ mod tests {
             ("/relay", "post"),
             ("/relay/config", "post"),
             ("/relay/delete", "post"),
+            ("/relay/identity", "post"),
             ("/relay/status", "post"),
             ("/rtos/end", "post"),
             ("/rtos/start", "post"),

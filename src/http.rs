@@ -87,6 +87,7 @@ fn is_hardware_operation(path: &str) -> bool {
         path,
         "/relay"
             | "/relay/status"
+            | "/relay/identity"
             | "/relay/config"
             | "/relay/delete"
             | "/devCon/delete"
@@ -175,6 +176,7 @@ async fn guarded_request(state: Arc<AppState>, mut request: Request<Body>, next:
         path.as_str(),
         "/relay"
             | "/relay/status"
+            | "/relay/identity"
             | "/relay/config"
             | "/relay/delete"
             | "/devCon/delete"
@@ -469,11 +471,10 @@ fn map_usb_to_mac_sync(
         "approved board wiring loaded from hardware policy"
     );
 
-    if relay.serial != serial || relay.channel != channel {
+    if state.relay.identity()?.serial_number != serial || relay.channel != channel {
         tracing::warn!(
             requested_serial = %serial,
             requested_channel = channel,
-            approved_serial = %relay.serial,
             approved_channel = relay.channel,
             "requested relay/channel differs from approved wiring"
         );
@@ -760,6 +761,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         router = router
             .route("/relay", post(relay::relay_handler))
             .route("/relay/status", post(relay::relay_status_handler))
+            .route("/relay/identity", post(relay::relay_identity_handler))
             .route("/relay/config", post(relay::relay_config_handler))
             .route("/relay/delete", post(relay::relay_delete_handler))
             .route("/devCon/delete", post(relay::devcon_delete_handler))
@@ -799,15 +801,29 @@ fn required<T>(value: Option<T>, field: &str) -> crate::error::AppResult<T> {
     })
 }
 
-async fn flashwriter_target(
-    state: &AppState,
+struct FlashWriterTargetRequest {
     generation: u8,
     mac: String,
     serial: String,
     channel: u8,
-    gpio1: u32,
-    gpio2: u32,
+    gpio: u32,
+    gpio_default_level: crate::models::VoltageLevel,
+    relay_default_level: crate::models::VoltageLevel,
+}
+
+async fn flashwriter_target(
+    state: &AppState,
+    request: FlashWriterTargetRequest,
 ) -> crate::error::AppResult<ipl::FlashWriterTarget> {
+    let FlashWriterTargetRequest {
+        generation,
+        mac,
+        serial,
+        channel,
+        gpio,
+        gpio_default_level,
+        relay_default_level,
+    } = request;
     if !ipl::supports_relay_flash(generation) || !state.features.generation_enabled(generation) {
         return Err(crate::error::AppError::Msg(format!(
             "Gen{generation} relay flashing is not enabled"
@@ -822,9 +838,9 @@ async fn flashwriter_target(
         .as_ref()
         .ok_or_else(|| crate::error::AppError::Msg("approved relay binding missing".into()))?;
 
-    if approved_relay.serial != serial
+    if state.relay.identity()?.serial_number != serial
         || approved_relay.channel != channel
-        || approved.gpios != Some([gpio1, gpio2])
+        || approved.gpio != Some(gpio)
     {
         return Err(crate::error::AppError::Msg(
             "relay or GPIO request differs from approved board wiring".into(),
@@ -833,10 +849,8 @@ async fn flashwriter_target(
 
     let approved_tty = crate::usb::resolve_identity(&approved.uart)?;
 
-    if channel > 7 || gpio1 == gpio2 {
-        return Err(crate::error::AppError::Msg(
-            "channel must be 0..7 and GPIO offsets must differ".into(),
-        ));
+    if channel > 7 {
+        return Err(crate::error::AppError::Msg("channel must be 0..7".into()));
     }
 
     let tty = state
@@ -860,8 +874,9 @@ async fn flashwriter_target(
         mac,
         serial,
         channel,
-        gpio1,
-        gpio2,
+        gpio,
+        gpio_default_level,
+        relay_default_level,
     })
 }
 
@@ -881,12 +896,18 @@ async fn prepare_flash(
         generation @ (3 | 4) => {
             let target = flashwriter_target(
                 state,
-                generation,
-                mac,
-                required(request.serial, "serial")?,
-                required(request.channel, "channel")?,
-                required(request.gpio1, "gpio1")?,
-                required(request.gpio2, "gpio2")?,
+                FlashWriterTargetRequest {
+                    generation,
+                    mac,
+                    serial: required(request.serial, "serial")?,
+                    channel: required(request.channel, "channel")?,
+                    gpio: required(request.gpio, "gpio")?,
+                    gpio_default_level: required(request.gpio_default_level, "gpioDefaultLevel")?,
+                    relay_default_level: required(
+                        request.relay_default_level,
+                        "relayDefaultLevel",
+                    )?,
+                },
             )
             .await?;
 
@@ -1038,12 +1059,15 @@ async fn execute_ipl_mode(
     let generation = state.cfg.gen.as_int();
     let target = match flashwriter_target(
         &state,
-        generation,
-        request.mac,
-        request.serial,
-        request.channel,
-        request.gpio1,
-        request.gpio2,
+        FlashWriterTargetRequest {
+            generation,
+            mac: request.mac,
+            serial: request.serial,
+            channel: request.channel,
+            gpio: request.gpio,
+            gpio_default_level: request.gpio_default_level,
+            relay_default_level: request.relay_default_level,
+        },
     )
     .await
     {
@@ -1385,10 +1409,7 @@ async fn relay(
         }
     };
 
-    if !state
-        .hardware
-        .relay_allowed(&request.serial, request.channel)
-    {
+    if !state.hardware.relay_allowed(request.channel) {
         return error_response(
             "relay/channel is not approved by hardware policy",
             StatusCode::FORBIDDEN,
@@ -1432,10 +1453,7 @@ async fn relay_status(
         return error_response(error.to_string(), StatusCode::BAD_REQUEST);
     }
 
-    if !state
-        .hardware
-        .relay_allowed(&request.serial, request.channel)
-    {
+    if !state.hardware.relay_allowed(request.channel) {
         return error_response(
             "relay/channel is not approved by hardware policy",
             StatusCode::FORBIDDEN,
@@ -1461,6 +1479,59 @@ async fn relay_status(
             format!("relay status worker failed: {error}"),
             StatusCode::INTERNAL_SERVER_ERROR,
         ),
+    }
+}
+
+async fn relay_identity(
+    State(state): State<Arc<AppState>>,
+    Extension(lease): Extension<Lease>,
+    Json(request): Json<RelayIdentityUpdateRequest>,
+) -> Response {
+    log_handler_request!("relay_identity", &request);
+
+    if request.vid_pid.trim().is_empty() {
+        return error_response(
+            "vidPid is required; serialNumber is optional",
+            StatusCode::BAD_REQUEST,
+        );
+    }
+
+    let result = task::spawn_blocking(move || {
+        let _lease = lease;
+        let _mapping = mapping_guard()?;
+        let identity = crate::relay::RelayController::resolve(crate::relay::RelaySelector {
+            serial_number: request.serial_number,
+            vid_pid: Some(request.vid_pid),
+        })?;
+        let previous = state.relay.identity()?;
+        let mut updated = UsbMappings::new();
+        for ((mac, serial, channel), tty) in state.usb_map.blocking_read().clone() {
+            let serial = if serial == previous.serial_number {
+                identity.serial_number.clone()
+            } else {
+                serial
+            };
+            if updated.insert((mac, serial, channel), tty).is_some() {
+                return Err(crate::error::AppError::Msg(
+                    "relay identity update would create duplicate mappings".into(),
+                ));
+            }
+        }
+        persist_usb_mappings(&state, &updated)?;
+        *state.usb_map.blocking_write() = updated;
+        state.relay.update_identity(identity.clone())?;
+        Ok::<_, crate::error::AppError>(identity)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(identity)) => Json(serde_json::json!({
+            "OK": true,
+            "relay": identity,
+        }))
+        .into_response(),
+        Ok(Err(error)) => error_response(error.to_string(), StatusCode::BAD_REQUEST),
+        Err(error) => error_response(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
@@ -1753,7 +1824,9 @@ async fn resolve_rtos_tty(
             .as_ref()
             .ok_or_else(|| AppError::Msg("approved relay binding missing".into()))?;
 
-        if serial != Some(relay.serial.as_str()) || channel != Some(relay.channel) {
+        if serial != Some(state.relay.identity()?.serial_number.as_str())
+            || channel != Some(relay.channel)
+        {
             return Err(AppError::Msg(
                 "RTOS request does not match approved relay binding".into(),
             ));
@@ -2277,7 +2350,7 @@ mod tests {
             usb_map: RwLock::new(HashMap::new()),
             gen5_map: RwLock::new(HashMap::new()),
             rtos_sessions: Mutex::new(HashMap::new()),
-            relay: RelayController::new(),
+            relay: RelayController::new(None).unwrap(),
             deletion_requested: AtomicBool::new(false),
             client: reqwest::Client::new(),
             jobs: Jobs::default(),

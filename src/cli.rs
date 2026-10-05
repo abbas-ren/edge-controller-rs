@@ -106,6 +106,20 @@ struct CliArgs {
 
     #[arg(long, action = ArgAction::SetTrue, help = "Enable RTOS capture endpoints")]
     enable_rtos: bool,
+
+    #[arg(
+        long,
+        requires = "vid_pid",
+        help = "Relay-board USB iSerial value; requires --vid-pid"
+    )]
+    relay_serial_number: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "VID:PID",
+        help = "Required relay-board hexadecimal USB VID:PID; discovers iSerial when serial is omitted"
+    )]
+    vid_pid: Option<String>,
 }
 
 /// Parsed command-line mode for the controller process.
@@ -133,6 +147,10 @@ pub enum Cli {
         bind_port: u16,
         /// Explicit generation and RTOS route toggles.
         features: FeatureFlags,
+        /// Optional relay-board USB iSerial value.
+        relay_serial_number: Option<String>,
+        /// Relay-board USB VID:PID selector, required whenever a relay is selected.
+        vid_pid: Option<String>,
     },
 }
 
@@ -170,6 +188,8 @@ impl Cli {
                     metrics_port: args.metrics_port,
                     bind_port: args.bind_port,
                     features,
+                    relay_serial_number: args.relay_serial_number,
+                    vid_pid: args.vid_pid,
                 })
             }
             Err(error)

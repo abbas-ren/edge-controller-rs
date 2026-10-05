@@ -374,17 +374,16 @@ pub fn validate_snapshot(
             invalid("approved board lacks a relay binding")
         })?;
 
-        if relay.serial != *serial || relay.channel != *channel {
+        if relay.channel != *channel {
             tracing::warn!(
                 mac = %mac,
                 stored_serial = %serial,
                 stored_channel = channel,
-                approved_serial = %relay.serial,
                 approved_channel = relay.channel,
-                "persisted relay/channel differs from approved wiring"
+                "persisted relay channel differs from approved wiring"
             );
             return Err(invalid(
-                "persisted relay/channel differs from approved wiring",
+                "persisted relay channel differs from approved wiring",
             ));
         }
 
@@ -748,11 +747,9 @@ mod tests {
                             "interface": 0
                         },
                         "relay": {
-
-                            "serial": "RELAY-A",
                             "channel": 0
                         },
-                        "gpios": [17, 27]
+                        "gpio": 17
                     },
                     {
                         "mac": "aabbccddee02",
@@ -805,7 +802,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_relay_assignment_must_match_policy() {
+    fn persisted_relay_channel_must_match_policy_and_serial_is_dynamic() {
         let policy = test_policy();
 
         let wrong_channel = parse_usb("/dev/ttyUSB0,aabbccddee01,RELAY-A,1\n").unwrap();
@@ -814,7 +811,7 @@ mod tests {
 
         assert!(validate_snapshot(&wrong_channel, &Gen5Mappings::new(), &policy,).is_err());
 
-        assert!(validate_snapshot(&wrong_serial, &Gen5Mappings::new(), &policy,).is_err());
+        validate_snapshot(&wrong_serial, &Gen5Mappings::new(), &policy).unwrap();
     }
 
     #[test]

@@ -27,6 +27,15 @@ pub async fn relay_status_handler(
     super::relay_status(State(state), Extension(lease), Json(request)).await
 }
 
+/// Replace the active relay USB identity and migrate persisted mappings.
+pub async fn relay_identity_handler(
+    State(state): State<Arc<AppState>>,
+    Extension(lease): Extension<Lease>,
+    Json(request): Json<super::RelayIdentityUpdateRequest>,
+) -> Response {
+    super::relay_identity(State(state), Extension(lease), Json(request)).await
+}
+
 /// Validate and persist a board-to-relay mapping.
 pub async fn relay_config_handler(
     State(state): State<Arc<AppState>>,

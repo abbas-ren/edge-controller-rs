@@ -1,5 +1,30 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum VoltageLevel {
+    #[default]
+    Low,
+    High,
+}
+
+fn default_optional_voltage_level() -> Option<VoltageLevel> {
+    Some(VoltageLevel::Low)
+}
+
+impl VoltageLevel {
+    pub fn is_high(self) -> bool {
+        self == Self::High
+    }
+
+    pub fn inverse(self) -> Self {
+        match self {
+            Self::Low => Self::High,
+            Self::High => Self::Low,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Generation {
@@ -41,6 +66,13 @@ pub struct RelayStatusRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayIdentityUpdateRequest {
+    pub serial_number: Option<String>,
+    pub vid_pid: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayConfigRequest {
     pub mac: String,
     pub serial: String,
@@ -72,8 +104,17 @@ pub struct ConfirmationRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IplRequest {
     pub gen: u8,
-    pub gpio1: Option<u32>,
-    pub gpio2: Option<u32>,
+    pub gpio: Option<u32>,
+    #[serde(
+        rename = "gpioDefaultLevel",
+        default = "default_optional_voltage_level"
+    )]
+    pub gpio_default_level: Option<VoltageLevel>,
+    #[serde(
+        rename = "relayDefaultLevel",
+        default = "default_optional_voltage_level"
+    )]
+    pub relay_default_level: Option<VoltageLevel>,
     pub mac: Option<String>,
     pub serial: Option<String>,
     pub channel: Option<u8>,
@@ -86,8 +127,11 @@ pub struct IplRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IplModeRequest {
-    pub gpio1: u32,
-    pub gpio2: u32,
+    pub gpio: u32,
+    #[serde(rename = "gpioDefaultLevel", default)]
+    pub gpio_default_level: VoltageLevel,
+    #[serde(rename = "relayDefaultLevel", default)]
+    pub relay_default_level: VoltageLevel,
     pub mac: String,
     pub serial: String,
     pub channel: u8,
@@ -187,4 +231,43 @@ pub struct HeartbeatPayload {
     pub disk_total: String,
     #[serde(rename = "diskUsagePercent")]
     pub disk_usage_percent: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IplModeRequest, IplRequest, RelayIdentityUpdateRequest, VoltageLevel};
+
+    #[test]
+    fn ipl_voltage_levels_default_low() {
+        let request: IplRequest = serde_json::from_value(serde_json::json!({
+            "gen": 4
+        }))
+        .unwrap();
+
+        assert_eq!(request.gpio_default_level, Some(VoltageLevel::Low));
+        assert_eq!(request.relay_default_level, Some(VoltageLevel::Low));
+    }
+
+    #[test]
+    fn ipl_mode_voltage_levels_default_low() {
+        let request: IplModeRequest = serde_json::from_value(serde_json::json!({
+            "gpio": 17,
+            "mac": "aabbccddeeff",
+            "serial": "RELAY-A",
+            "channel": 0
+        }))
+        .unwrap();
+
+        assert_eq!(request.gpio_default_level, VoltageLevel::Low);
+        assert_eq!(request.relay_default_level, VoltageLevel::Low);
+    }
+
+    #[test]
+    fn relay_identity_requires_vid_pid_in_the_wire_contract() {
+        let result = serde_json::from_value::<RelayIdentityUpdateRequest>(serde_json::json!({
+            "serialNumber": "RELAY-A"
+        }));
+
+        assert!(result.is_err());
+    }
 }

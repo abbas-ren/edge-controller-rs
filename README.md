@@ -31,6 +31,19 @@ Gen3 and Gen4 use the same relay/GPIO FlashWriter sequence. Gen5 uses the
 administrator-installed X5H script and its built-in CPLD power interface, so it
 does not require relay or GPIO bindings.
 
+Gen3/Gen4 startup requires `--vid-pid <VID:PID>`. The optional
+`--relay-serial-number <iSerial>` is accepted only with `--vid-pid`. When the
+serial is omitted, exactly one matching USB relay must be connected so its
+iSerial can be resolved. The hardware policy
+assigns one `gpio` and one relay `channel` per board; relay identity is runtime
+configuration rather than static policy.
+
+Firmware requests configure resting `gpioDefaultLevel` and `relayDefaultLevel`
+values independently as `HIGH` or `LOW`; both default to `LOW`. With those
+defaults, normal boot holds GPIO LOW and leaves the relay de-energized at LOW.
+Entering download mode preserves the hardware sequence: relay HIGH, wait two
+seconds, GPIO HIGH, wait two seconds, then relay LOW.
+
 ## Logging
 
 Structured console logging is enabled by default. `--log-level` accepts
@@ -54,7 +67,8 @@ Operational endpoints:
 Hardware endpoints:
 
 - Relay and mapping: `/relay`, `/relay/status`, `/relay/config`,
-	`/relay/delete`, `/devCon/delete`, `/mapping/entry`, `/reboot-device`
+	`/relay/identity`, `/relay/delete`, `/devCon/delete`, `/mapping/entry`,
+	`/reboot-device`
 - Firmware: `/ipl`, `/ipl-mode`, `/ipl-mode/default`, `/ipl/remove`
 - Gen5: `/gen5/tty_entry`, `/gen5/power`
 - RTOS capture: `/rtos/start`, `/rtos/end`
@@ -120,11 +134,12 @@ systemctl daemon-reload
 systemctl enable --now dev-con.service
 ```
 
-The unit defaults to `--enable-gen4`. Override enabled generations, RTOS
-capture, or other CLI options in `/etc/default/edgecontroller`:
+The unit defaults to Gen4 and FTDI VID:PID `0403:6001`. Override the relay
+selector, enabled generations, RTOS capture, or other CLI options in
+`/etc/default/edgecontroller`:
 
 ```sh
-EDGE_CONTROLLER_ARGS="--enable-gen5 --enable-rtos --log-file /var/log/edgecontroller.log"
+EDGE_CONTROLLER_ARGS="--enable-gen4 --relay-serial-number AB0OFAFX --vid-pid 0403:6001 --log-file /var/log/edgecontroller.log"
 ```
 
 Install the login configuration at `/etc/config/login.cfg`, the hardware policy

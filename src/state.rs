@@ -5,7 +5,7 @@ use crate::{
     jobs::Jobs,
     models::{RegistrationPayload, RelayInventory},
     observability::metrics::global_metrics,
-    relay::RelayController,
+    relay::{RelayController, RelaySelector},
     store::{self, Gen5Mappings, UsbMappings},
     FeatureFlags,
 };
@@ -59,6 +59,7 @@ impl AppState {
         board_mac: String,
         board_ip: String,
         features: FeatureFlags,
+        relay_selector: Option<RelaySelector>,
     ) -> AppResult<Arc<Self>> {
         cfg.validate()?;
         store::checked_mac(&board_mac)?;
@@ -136,6 +137,7 @@ impl AppState {
                 AppError::Msg(format!("HTTP client initialization failed: {error}"))
             })?;
 
+        let relay = RelayController::new(relay_selector)?;
         let state = Arc::new(Self {
             cfg,
             controller: RwLock::new(ControllerInfo {
@@ -146,7 +148,7 @@ impl AppState {
             usb_map: RwLock::new(usb_map),
             gen5_map: RwLock::new(gen5_map),
             rtos_sessions: Mutex::new(HashMap::new()),
-            relay: RelayController::new(),
+            relay,
             deletion_requested: AtomicBool::new(false),
             client,
             jobs: Jobs::default(),
@@ -283,7 +285,7 @@ mod tests {
             usb_map: RwLock::new(HashMap::new()),
             gen5_map: RwLock::new(HashMap::new()),
             rtos_sessions: Mutex::new(HashMap::new()),
-            relay: RelayController::new(),
+            relay: RelayController::new(None).unwrap(),
             deletion_requested: AtomicBool::new(false),
             client: reqwest::Client::new(),
             jobs: Jobs::default(),
