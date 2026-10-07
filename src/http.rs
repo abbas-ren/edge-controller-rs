@@ -1562,18 +1562,25 @@ async fn relay_config(
     })
     .await;
 
-    let success = matches!(mapped, Ok(Ok(true)));
+    let outcome = match mapped {
+        Ok(Ok(true)) => Ok(()),
+        Ok(Ok(false)) => Err((
+            "board probe did not match the requested MAC".to_owned(),
+            StatusCode::BAD_REQUEST,
+        )),
+        Ok(Err(error)) => Err((error.to_string(), StatusCode::BAD_REQUEST)),
+        Err(error) => Err((error.to_string(), StatusCode::INTERNAL_SERVER_ERROR)),
+    };
+    let success = outcome.is_ok();
 
     let _ = notify_relay_config(&state, &request.mac, success).await;
 
-    if success {
-        info!(handler = "relay_config", mac = %request.mac, serial = %request.serial, channel = request.channel, generation = request.gen, "relay configuration persisted");
-        ok().into_response()
-    } else {
-        error_response(
-            "could not associate UART with requested MAC",
-            StatusCode::BAD_REQUEST,
-        )
+    match outcome {
+        Ok(()) => {
+            info!(handler = "relay_config", mac = %request.mac, serial = %request.serial, channel = request.channel, generation = request.gen, "relay configuration persisted");
+            ok().into_response()
+        }
+        Err((message, status)) => error_response(message, status),
     }
 }
 
