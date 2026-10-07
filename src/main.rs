@@ -12,7 +12,6 @@ mod config;
 mod constants;
 mod error;
 mod gpio;
-mod hardware;
 mod http;
 mod ipl;
 mod jobs;
@@ -166,17 +165,10 @@ async fn main() -> Result<()> {
             "HTTP hardware-control API is exposed without bearer authentication"
         );
     }
-    let hardware_path = config::configured_hardware_path()?;
     // This branch must precede signal installation, interface discovery,
     // AppState construction, USB inventory, and server startup.
     if check_only {
-        return runtime::check_offline(
-            &cfg,
-            &config_path,
-            &hardware_path,
-            bind_address,
-            api_token.is_some(),
-        );
+        return runtime::check_offline(&cfg, &config_path, bind_address, api_token.is_some());
     }
 
     // Network discovery is synchronous and runs before request handling.

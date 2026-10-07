@@ -2,15 +2,16 @@ mod gen4;
 mod gen5;
 mod relay;
 mod rtos;
+mod uart_mapping;
 
 use crate::{jobs::Lease, state::RtosSession};
 use axum::{
     body::Body,
-    extract::{Extension, MatchedPath, State},
+    extract::{Extension, MatchedPath, Query, State},
     http::{header, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 
@@ -27,7 +28,7 @@ use std::{
 use tokio::task;
 use tracing::{debug, error, info, warn};
 
-use crate::store::{Gen5Mappings, UsbMappings};
+use crate::store::{Gen5Mappings, UartMapping, UartMappings, UsbMappings};
 use crate::{
     config::*,
     ipl,
@@ -53,6 +54,308 @@ const MAX_CAPTURE_BYTES: u64 = 64 * 1024 * 1024;
 /// Clients must not issue those operations while discovery is running.
 static MAPPING_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+fn persist_uart_mappings(mappings: &UartMappings) -> crate::error::AppResult<()> {
+    let contents = crate::store::encode_uart(mappings)?;
+    crate::store::atomic_replace(Path::new(UART_MAPPING_FILE), contents.as_bytes())
+}
+
+fn parse_vid_pid(value: &str) -> crate::error::AppResult<(u16, u16)> {
+    let Some((vid, pid)) = value.split_once(':') else {
+        return Err(crate::error::AppError::Msg(
+            "UART VID:PID must use the form 1234:abcd".into(),
+        ));
+    };
+    if vid.len() != 4
+        || pid.len() != 4
+        || !vid
+            .bytes()
+            .chain(pid.bytes())
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(crate::error::AppError::Msg(
+            "UART VID:PID must contain four hex digits on each side".into(),
+        ));
+    }
+    Ok((
+        u16::from_str_radix(vid, 16).expect("validated VID"),
+        u16::from_str_radix(pid, 16).expect("validated PID"),
+    ))
+}
+
+fn disconnected_uart(
+    before: &[UsbTty],
+    current: &[UsbTty],
+    vid: u16,
+    pid: u16,
+    expected_tty: Option<&str>,
+) -> crate::error::AppResult<Option<UsbTty>> {
+    let current_topologies = current
+        .iter()
+        .filter(|device| device.vid == vid && device.pid == pid)
+        .map(|device| device.topology.as_path())
+        .collect::<std::collections::HashSet<_>>();
+    let mut disappeared = before
+        .iter()
+        .filter(|device| {
+            device.vid == vid
+                && device.pid == pid
+                && expected_tty.is_none_or(|tty| device.tty == tty)
+                && !current_topologies.contains(device.topology.as_path())
+        })
+        .collect::<Vec<_>>();
+    disappeared.sort_unstable_by_key(|device| (&device.topology, device.interface));
+    disappeared.dedup_by_key(|device| &device.topology);
+
+    match disappeared.as_slice() {
+        [] => Ok(None),
+        [device] => Ok(Some((*device).clone())),
+        _ => Err(crate::error::AppError::Msg(
+            "more than one matching UART topology disconnected; mapping is ambiguous".into(),
+        )),
+    }
+}
+
+fn connection_type(topology: &Path) -> crate::error::AppResult<String> {
+    let name = topology
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| crate::error::AppError::Msg("invalid UART topology path".into()))?;
+    Ok(if name.contains('.') {
+        "hub"
+    } else {
+        "standalone"
+    }
+    .into())
+}
+
+fn wait_for_uart_disconnect(
+    before: &[UsbTty],
+    vid: u16,
+    pid: u16,
+    expected_tty: Option<&str>,
+) -> crate::error::AppResult<UsbTty> {
+    for _ in 0..60 {
+        let current = crate::usb::inventory()?;
+        if let Some(device) = disconnected_uart(before, &current, vid, pid, expected_tty)? {
+            return Ok(device);
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    Err(crate::error::AppError::Msg(
+        "the requested UART did not disconnect while target power was off".into(),
+    ))
+}
+
+fn wait_for_uart_reconnect(
+    disconnected: &UsbTty,
+    vid: u16,
+    pid: u16,
+) -> crate::error::AppResult<UsbTty> {
+    for _ in 0..60 {
+        let mut matches = crate::usb::inventory()?
+            .into_iter()
+            .filter(|device| {
+                device.vid == vid
+                    && device.pid == pid
+                    && device.interface == disconnected.interface
+                    && device.topology == disconnected.topology
+            })
+            .collect::<Vec<_>>();
+        if matches.len() == 1 {
+            return Ok(matches.remove(0));
+        }
+        if matches.len() > 1 {
+            return Err(crate::error::AppError::Msg(
+                "the requested UART reappeared more than once at the same topology".into(),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    Err(crate::error::AppError::Msg(
+        "the requested UART did not reconnect at its original topology".into(),
+    ))
+}
+
+enum UartPowerControl {
+    Relay { serial: String, channel: u8 },
+    Gen5 { power_tty: String },
+}
+
+impl UartPowerControl {
+    fn set(&self, state: &AppState, on: bool) -> crate::error::AppResult<()> {
+        match self {
+            Self::Relay { serial, channel } => state.relay.set_channel(serial, *channel, on),
+            Self::Gen5 { power_tty } => {
+                write_to_path(power_tty, if on { "POWER#ON\n" } else { "POWER#OFF\n" })
+            }
+        }
+    }
+}
+
+fn strict_uart_power_cycle(
+    state: &AppState,
+    control: &UartPowerControl,
+    vid: u16,
+    pid: u16,
+    expected_tty: Option<&str>,
+) -> crate::error::AppResult<UsbTty> {
+    let before = crate::usb::inventory()?;
+    let expected_count = before
+        .iter()
+        .filter(|device| {
+            device.vid == vid
+                && device.pid == pid
+                && expected_tty.is_none_or(|tty| device.tty == tty)
+        })
+        .count();
+    if expected_count != 1 {
+        return Err(crate::error::AppError::Msg(format!(
+            "expected exactly one active UART matching {vid:04x}:{pid:04x}, found {expected_count}"
+        )));
+    }
+
+    control.set(state, false)?;
+    let disconnected = wait_for_uart_disconnect(&before, vid, pid, expected_tty);
+    let power_on = control.set(state, true);
+    if let Err(error) = power_on {
+        return Err(crate::error::AppError::Msg(format!(
+            "failed to restore target power after UART verification: {error}"
+        )));
+    }
+    let disconnected = disconnected?;
+    wait_for_uart_reconnect(&disconnected, vid, pid)
+}
+
+fn configure_uart_sync(
+    state: Arc<AppState>,
+    request: UartConfigRequest,
+) -> crate::error::AppResult<UartConfigResponse> {
+    let mac = validated_mac(&request.mac)?;
+    let (vid, pid) = parse_vid_pid(&request.vid_pid)?;
+
+    let (control, expected_tty, relay_serial, channel) = match request.gen {
+        3 | 4 => {
+            let serial = request.serial.ok_or_else(|| {
+                crate::error::AppError::Msg(
+                    "Gen3/Gen4 UART configuration requires relay serial".into(),
+                )
+            })?;
+            let channel = request
+                .channel
+                .filter(|channel| *channel <= 7)
+                .ok_or_else(|| {
+                    crate::error::AppError::Msg(
+                        "Gen3/Gen4 UART configuration requires relay channel 0..7".into(),
+                    )
+                })?;
+            let tty = state
+                .usb_map
+                .blocking_read()
+                .get(&(mac.clone(), serial.clone(), channel))
+                .cloned()
+                .ok_or_else(|| {
+                    crate::error::AppError::Msg(
+                        "relay/GPIO mapping is not confirmed for this device and channel".into(),
+                    )
+                })?;
+            (
+                UartPowerControl::Relay {
+                    serial: serial.clone(),
+                    channel,
+                },
+                Some(tty),
+                serial,
+                channel,
+            )
+        }
+        5 => {
+            if request.serial.is_some() || request.channel.is_some() {
+                return Err(crate::error::AppError::Msg(
+                    "Gen5 UART configuration does not accept relay or GPIO information".into(),
+                ));
+            }
+            let Some((uart, power_tty)) = resolve_gen5_mapping_sync(state.clone(), &mac)? else {
+                return Err(crate::error::AppError::Msg(
+                    "could not resolve the Gen5 UART and CPLD power pair by device MAC".into(),
+                ));
+            };
+            (
+                UartPowerControl::Gen5 { power_tty },
+                Some(uart),
+                "-".into(),
+                0,
+            )
+        }
+        _ => {
+            return Err(crate::error::AppError::Msg(
+                "UART configuration supports generation 3, 4, or 5".into(),
+            ));
+        }
+    };
+
+    let _operation = mapping_guard()?;
+    let resolved = strict_uart_power_cycle(&state, &control, vid, pid, expected_tty.as_deref())?;
+    let topology = resolved.topology.to_string_lossy().into_owned();
+    let connection = connection_type(&resolved.topology)?;
+    let mapping = UartMapping {
+        mac: mac.clone(),
+        generation: request.gen,
+        tty: resolved.tty.clone(),
+        vid,
+        pid,
+        usb_serial: resolved.serial.clone(),
+        interface: resolved.interface,
+        topology: topology.clone(),
+        connection: connection.clone(),
+        relay_serial,
+        channel,
+    };
+    let mut mappings = state.uart_map.blocking_read().clone();
+    if mappings.iter().any(|(stored_mac, stored)| {
+        stored_mac != &mac && (stored.tty == mapping.tty || stored.topology == mapping.topology)
+    }) {
+        return Err(crate::error::AppError::Msg(
+            "resolved UART is already mapped to another target device".into(),
+        ));
+    }
+    mappings.insert(mac.clone(), mapping);
+    persist_uart_mappings(&mappings)?;
+    *state.uart_map.blocking_write() = mappings;
+
+    Ok(UartConfigResponse {
+        mac,
+        generation: request.gen,
+        vid_pid: format!("{vid:04x}:{pid:04x}"),
+        tty: resolved.tty,
+        usb_serial: resolved.serial,
+        interface: resolved.interface,
+        topology,
+        connection,
+        verified: true,
+    })
+}
+
+async fn uart_config(
+    State(state): State<Arc<AppState>>,
+    Extension(lease): Extension<Lease>,
+    Json(request): Json<UartConfigRequest>,
+) -> Response {
+    info!(handler = "uart_config", "API handler invoked");
+    let result = task::spawn_blocking(move || {
+        let _lease = lease;
+        configure_uart_sync(state, request)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(response)) => Json(response).into_response(),
+        Ok(Err(error)) => error_response(error.to_string(), StatusCode::BAD_REQUEST),
+        Err(error) => error_response(
+            format!("UART configuration worker failed: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
 /// Compare equal-length tokens without early exit on differing bytes.
 ///
 /// Token length is not secret. This avoids an obvious byte-by-byte timing
@@ -89,6 +392,7 @@ fn is_hardware_operation(path: &str) -> bool {
             | "/relay/status"
             | "/relay/identity"
             | "/relay/config"
+            | "/uart/config"
             | "/relay/delete"
             | "/devCon/delete"
             | "/ipl"
@@ -325,7 +629,7 @@ fn persist_usb_mappings(state: &AppState, mappings: &UsbMappings) -> crate::erro
         gen5_count = other.len(),
         "persisting USB mappings"
     );
-    crate::store::validate_snapshot(mappings, &other, &state.hardware)?;
+    crate::store::validate_snapshot(mappings, &other)?;
 
     let contents = crate::store::encode_usb(mappings)?;
     crate::store::atomic_replace(Path::new(USB_MAPPING_FILE), contents.as_bytes())?;
@@ -344,7 +648,7 @@ fn persist_gen5_mappings(state: &AppState, mappings: &Gen5Mappings) -> crate::er
         usb_count = other.len(),
         "persisting Gen5 mappings"
     );
-    crate::store::validate_snapshot(&other, mappings, &state.hardware)?;
+    crate::store::validate_snapshot(&other, mappings)?;
 
     let contents = crate::store::encode_gen5(mappings)?;
     crate::store::atomic_replace(Path::new(GEN5_MAPPING_FILE), contents.as_bytes())?;
@@ -379,7 +683,7 @@ where
         "starting board power-cycle probe"
     );
 
-    let observation = (|| {
+    let observation = (|| -> crate::error::AppResult<_> {
         set_power(false)?;
         std::thread::sleep(off_delay);
 
@@ -422,6 +726,83 @@ where
     }
 }
 
+fn probe_uart_candidates<F>(
+    candidates: Vec<(String, Box<dyn serialport::SerialPort>)>,
+    off_delay: Duration,
+    mut set_power: F,
+) -> crate::error::AppResult<Vec<(String, crate::error::AppResult<Option<String>>)>>
+where
+    F: FnMut(bool) -> crate::error::AppResult<()>,
+{
+    use crate::error::AppError;
+
+    let observation = (|| {
+        set_power(false)?;
+        std::thread::sleep(off_delay);
+
+        for (_, port) in &candidates {
+            port.clear(serialport::ClearBuffer::Input)
+                .map_err(|error| {
+                    AppError::Msg(format!("could not clear stale UART input: {error}"))
+                })?;
+        }
+
+        set_power(true)?;
+
+        Ok(std::thread::scope(|scope| {
+            let readers = candidates
+                .into_iter()
+                .map(|(tty, mut port)| {
+                    (
+                        tty,
+                        scope.spawn(move || read_uboot_mac(&mut *port, Duration::from_secs(20))),
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            readers
+                .into_iter()
+                .map(|(tty, reader)| {
+                    let result = reader.join().unwrap_or_else(|_| {
+                        Err(AppError::Msg("UART probe worker panicked".into()))
+                    });
+                    (tty, result)
+                })
+                .collect::<Vec<_>>()
+        }))
+    })();
+
+    let restart = (|| {
+        set_power(false)?;
+        std::thread::sleep(Duration::from_secs(1));
+        set_power(true)
+    })();
+
+    match (observation, restart) {
+        (Ok(results), Ok(())) => Ok(results),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(probe), Err(reset)) => Err(AppError::Msg(format!(
+            "UART probe failed: {probe}; board restart also failed: {reset}"
+        ))),
+    }
+}
+
+fn eligible_uart_candidates(
+    devices: Vec<crate::usb::UsbTty>,
+    used_paths: &std::collections::HashSet<String>,
+    relay_identity: &crate::relay::RelayIdentity,
+) -> Vec<crate::usb::UsbTty> {
+    devices
+        .into_iter()
+        .filter(|device| {
+            !used_paths.contains(&device.tty)
+                && !(device.vid == relay_identity.vid
+                    && device.pid == relay_identity.pid
+                    && device.serial.as_deref() == Some(relay_identity.serial_number.as_str()))
+        })
+        .collect()
+}
+
 /// Discover a Gen3/Gen4 console using a specific relay channel.
 ///
 /// Call only from spawn_blocking: blocking_lock/blocking_read and serial
@@ -458,66 +839,99 @@ fn map_usb_to_mac_sync(
         "beginning verified UART mapping for board"
     );
 
-    let binding = state.hardware.board(&mac, generation.as_int())?;
-    let relay = binding
-        .relay
-        .as_ref()
-        .ok_or_else(|| AppError::Msg("approved relay binding missing".into()))?;
+    if channel > 7 {
+        return Err(AppError::Msg("channel must be 0..7".into()));
+    }
 
-    tracing::debug!(
-        mac = %mac,
-        approved_uart = ?binding.uart,
-        approved_relay = ?relay,
-        "approved board wiring loaded from hardware policy"
-    );
-
-    if state.relay.identity()?.serial_number != serial || relay.channel != channel {
-        tracing::warn!(
-            requested_serial = %serial,
-            requested_channel = channel,
-            approved_channel = relay.channel,
-            "requested relay/channel differs from approved wiring"
-        );
+    let relay_identity = state.relay.identity()?;
+    if relay_identity.serial_number != serial {
         return Err(AppError::Msg(
-            "requested relay/channel differs from approved wiring".into(),
+            "requested relay serial does not match the active relay".into(),
         ));
     }
 
-    let tty = crate::usb::resolve_identity(&binding.uart)?;
+    let existing = state.usb_map.blocking_read().clone();
+    let gen5 = state.gen5_map.blocking_read().clone();
+    let used_paths = existing
+        .iter()
+        .filter(|((stored_mac, _, _), _)| stored_mac != &mac)
+        .map(|(_, tty)| tty.clone())
+        .chain(
+            gen5.values()
+                .flat_map(|entry| [entry.uart.clone(), entry.power.clone()]),
+        )
+        .collect::<std::collections::HashSet<_>>();
+
+    let mut candidates = eligible_uart_candidates(
+        crate::usb::inventory()?,
+        &used_paths,
+        &relay_identity,
+    )
+    .into_iter()
+    .filter_map(|device| {
+        tracing::debug!(
+            tty = %device.tty,
+            vid = device.vid,
+            pid = device.pid,
+            serial = ?device.serial,
+            interface = device.interface,
+            topology = %device.topology.display(),
+            "opening dynamic UART candidate"
+        );
+        match open_uart(&device.tty, baud) {
+            Ok(port) => Some((device.tty, port)),
+            Err(error) => {
+                tracing::warn!(tty = %device.tty, %error, "skipping unavailable UART candidate");
+                None
+            }
+        }
+    })
+    .collect::<Vec<_>>();
+
+    let current_tty = existing
+        .iter()
+        .find(|((stored_mac, _, _), _)| stored_mac == &mac)
+        .map(|(_, tty)| tty.as_str());
+    candidates.sort_by_key(|(tty, _)| (Some(tty.as_str()) != current_tty, tty.clone()));
+
+    if candidates.is_empty() {
+        return Err(AppError::Msg(
+            "no unassigned USB serial ports are available for mapping".into(),
+        ));
+    }
 
     tracing::info!(
         mac = %mac,
-        tty = %tty,
-        uart_identity = ?binding.uart,
-        "resolved approved UART to the live ttyUSB node"
+        candidate_count = candidates.len(),
+        "probing dynamic UART candidates"
     );
-
-    // Do not accept an old ttyUSB pathname as a verified cache hit.
-    let port = open_uart(&tty, baud)?;
-    let observed = probe_with_power(port, Duration::from_secs(3), |on| {
+    let observations = probe_uart_candidates(candidates, Duration::from_secs(3), |on| {
         state.relay.set_channel(&serial, channel, on)
     })?;
+    let tty = observations
+        .iter()
+        .find_map(|(tty, observed)| match observed {
+            Ok(Some(observed_mac)) if observed_mac == &mac => Some(tty.clone()),
+            _ => None,
+        });
 
-    tracing::debug!(
-        mac = %mac,
-        tty = %tty,
-        observed = ?observed,
-        "board probe completed; checking whether the observed MAC matches the requested one"
-    );
-
-    if observed.as_deref() != Some(mac.as_str()) {
-        tracing::warn!(
-            mac = %mac,
-            tty = %tty,
-            observed = ?observed,
-            "board probe did not match the requested MAC; mapping not persisted"
-        );
-        return Ok(false);
+    for (candidate, observed) in &observations {
+        match observed {
+            Ok(value) => {
+                tracing::debug!(tty = %candidate, observed = ?value, "UART candidate probe completed")
+            }
+            Err(error) => tracing::warn!(tty = %candidate, %error, "UART candidate probe failed"),
+        }
     }
+
+    let Some(tty) = tty else {
+        tracing::warn!(mac = %mac, "no UART candidate reported the requested MAC");
+        return Ok(false);
+    };
 
     tracing::info!(%mac, %tty, "board UART mapping verified and will be persisted");
 
-    let mut updated = state.usb_map.blocking_read().clone();
+    let mut updated = existing;
 
     // Remove stale entries for this board only after successful verification.
     updated.retain(|(stored_mac, _, _), _| stored_mac != &mac);
@@ -579,39 +993,59 @@ fn resolve_gen5_mapping_sync(
     let mac = validated_mac(mac)?;
     let _operation = mapping_guard()?;
 
-    let binding = state.hardware.board(&mac, 5)?;
-    let power_identity = binding
-        .power
-        .as_ref()
-        .ok_or_else(|| AppError::Msg("approved power binding missing".into()))?;
+    let existing = state.gen5_map.blocking_read().clone();
+    let usb = state.usb_map.blocking_read().clone();
+    let mut pairs = Vec::new();
 
-    let uart = crate::usb::resolve_identity(&binding.uart)?;
-    let power = crate::usb::resolve_identity(power_identity)?;
-
-    if uart == power {
-        return Err(AppError::Msg(
-            "UART and power controller resolved to the same device".into(),
-        ));
+    if let Some(current) = existing.get(&mac) {
+        pairs.push((current.uart.clone(), current.power.clone()));
     }
 
-    // Probe only the administrator-approved pair.
-    // This verifies the UART MAC, not the electrical power wiring.
-    let observed = probe_gen5_pair(&uart, &power)?;
+    let used_by_other_boards = existing
+        .iter()
+        .filter(|(stored_mac, _)| *stored_mac != &mac)
+        .flat_map(|(_, entry)| [entry.uart.as_str(), entry.power.as_str()])
+        .chain(usb.values().map(String::as_str))
+        .collect::<std::collections::HashSet<_>>();
+    let (uarts, powers) = crate::usb::discover_gen5_ttys()?;
 
-    if observed.as_deref() != Some(mac.as_str()) {
-        tracing::warn!(
-            mac = %mac,
-            uart = %uart,
-            power = %power,
-            observed = ?observed,
-            "Gen5 mapping probe did not confirm the requested board MAC"
-        );
+    for uart in uarts {
+        for power in &powers {
+            if uart != *power
+                && !used_by_other_boards.contains(uart.as_str())
+                && !used_by_other_boards.contains(power.as_str())
+                && !pairs
+                    .iter()
+                    .any(|pair| pair == &(uart.clone(), power.clone()))
+            {
+                pairs.push((uart.clone(), power.clone()));
+            }
+        }
+    }
+
+    let mut matched = None;
+    for (uart, power) in pairs {
+        match probe_gen5_pair(&uart, &power) {
+            Ok(Some(observed)) if observed == mac => {
+                matched = Some((uart, power));
+                break;
+            }
+            Ok(observed) => {
+                tracing::debug!(%uart, %power, ?observed, "Gen5 candidate pair did not match");
+            }
+            Err(error) => {
+                tracing::warn!(%uart, %power, %error, "Gen5 candidate pair probe failed");
+            }
+        }
+    }
+
+    let Some((uart, power)) = matched else {
         return Ok(None);
-    }
+    };
 
     tracing::info!(%mac, %uart, %power, "Gen5 board mapping verified");
 
-    let mut updated = state.gen5_map.blocking_read().clone();
+    let mut updated = existing;
     updated.remove(&mac);
 
     if updated.values().any(|entry| {
@@ -715,6 +1149,38 @@ async fn metrics_handler() -> Response {
         .into_response()
 }
 
+#[derive(serde::Deserialize)]
+struct RuntimeLogsQuery {
+    limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
+struct RuntimeLogLevelRequest {
+    level: String,
+}
+
+async fn runtime_logs_handler(Query(query): Query<RuntimeLogsQuery>) -> Response {
+    let level = match crate::logging::current_level() {
+        Ok(level) => level,
+        Err(error) => return error_response(error.to_string(), StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let logs = match crate::logging::recent(query.limit.unwrap_or(500)) {
+        Ok(logs) => logs,
+        Err(error) => return error_response(error.to_string(), StatusCode::SERVICE_UNAVAILABLE),
+    };
+    Json(serde_json::json!({"level": level, "logs": logs})).into_response()
+}
+
+async fn runtime_log_level_handler(Json(request): Json<RuntimeLogLevelRequest>) -> Response {
+    match crate::logging::set_level(&request.level) {
+        Ok(level) => {
+            info!(%level, "runtime log level updated");
+            Json(serde_json::json!({"level": level})).into_response()
+        }
+        Err(error) => error_response(error.to_string(), StatusCode::BAD_REQUEST),
+    }
+}
+
 fn ok() -> Json<serde_json::Value> {
     debug!("generic success response generated");
     Json(serde_json::json!({"OK": true}))
@@ -750,6 +1216,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/ready", get(readiness_handler))
         .route("/status", get(status_handler))
         .route("/metrics", get(metrics_handler))
+        .route("/logs", get(runtime_logs_handler))
+        .route("/logs/level", put(runtime_log_level_handler))
         .route(
             "/swagger.json",
             get(crate::observability::swagger::swagger_json),
@@ -771,6 +1239,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 
     if state.features.gen3 || state.features.gen4 || state.features.gen5 {
         router = router
+            .route("/uart/config", post(uart_mapping::uart_config_handler))
             .route("/ipl", post(gen4::ipl_run_handler))
             .route("/ipl/remove", post(gen4::ipl_remove_handler));
     }
@@ -832,22 +1301,11 @@ async fn flashwriter_target(
 
     let mac = validated_mac(&mac)?;
     validate_csv_field("serial", &serial)?;
-    let approved = state.hardware.board(&mac, generation)?;
-    let approved_relay = approved
-        .relay
-        .as_ref()
-        .ok_or_else(|| crate::error::AppError::Msg("approved relay binding missing".into()))?;
-
-    if state.relay.identity()?.serial_number != serial
-        || approved_relay.channel != channel
-        || approved.gpio != Some(gpio)
-    {
+    if state.relay.identity()?.serial_number != serial {
         return Err(crate::error::AppError::Msg(
-            "relay or GPIO request differs from approved board wiring".into(),
+            "requested relay serial does not match the active relay".into(),
         ));
     }
-
-    let approved_tty = crate::usb::resolve_identity(&approved.uart)?;
 
     if channel > 7 {
         return Err(crate::error::AppError::Msg("channel must be 0..7".into()));
@@ -862,11 +1320,6 @@ async fn flashwriter_target(
         .ok_or_else(|| crate::error::AppError::Msg("UART mapping not found".into()))?;
 
     let tty = checked_tty(&tty)?;
-    if tty != approved_tty {
-        return Err(crate::error::AppError::Msg(
-            "stored UART mapping is stale; verify the board mapping again".into(),
-        ));
-    }
 
     Ok(ipl::FlashWriterTarget {
         generation,
@@ -924,20 +1377,6 @@ async fn prepare_flash(
         5 => {
             let uart = checked_tty(&required(request.uart, "uart")?)?;
             let power = checked_tty(&required(request.power, "power")?)?;
-            let approved = state.hardware.board(&mac, 5)?;
-
-            let approved_power = approved.power.as_ref().ok_or_else(|| {
-                crate::error::AppError::Msg("approved Gen5 power binding missing".into())
-            })?;
-
-            if crate::usb::resolve_identity(&approved.uart)? != uart
-                || crate::usb::resolve_identity(approved_power)? != power
-            {
-                return Err(crate::error::AppError::Msg(
-                    "requested Gen5 devices differ from approved hardware identities".into(),
-                ));
-            }
-
             let sdk_version = required(request.sdk_ver, "sdk_ver")?;
 
             if uart == power
@@ -1409,13 +1848,6 @@ async fn relay(
         }
     };
 
-    if !state.hardware.relay_allowed(request.channel) {
-        return error_response(
-            "relay/channel is not approved by hardware policy",
-            StatusCode::FORBIDDEN,
-        );
-    }
-
     let relay_serial = request.serial.clone();
     let relay_state = request.state.clone();
     let relay_channel = request.channel;
@@ -1451,13 +1883,6 @@ async fn relay_status(
 
     if let Err(error) = validate_csv_field("serial", &request.serial) {
         return error_response(error.to_string(), StatusCode::BAD_REQUEST);
-    }
-
-    if !state.hardware.relay_allowed(request.channel) {
-        return error_response(
-            "relay/channel is not approved by hardware policy",
-            StatusCode::FORBIDDEN,
-        );
     }
 
     let relay_serial = request.serial.clone();
@@ -1823,34 +2248,36 @@ async fn resolve_rtos_tty(
         return Err(AppError::Msg("RTOS capture supports Gen4 and Gen5".into()));
     }
 
-    let board = state.hardware.board(&mac, generation)?;
-
-    if generation == 4 {
-        let relay = board
-            .relay
-            .as_ref()
-            .ok_or_else(|| AppError::Msg("approved relay binding missing".into()))?;
-
-        if serial != Some(state.relay.identity()?.serial_number.as_str())
-            || channel != Some(relay.channel)
-        {
-            return Err(AppError::Msg(
-                "RTOS request does not match approved relay binding".into(),
-            ));
-        }
-    }
-
-    let tty = state.hardware.rtos_device(&mac, generation)?;
-
     if let Some(supplied) = explicit_tty {
-        if checked_tty(supplied)? != tty {
-            return Err(AppError::Msg(
-                "requested RTOS TTY differs from approved interface".into(),
-            ));
-        }
+        return checked_tty(supplied);
     }
 
-    Ok(tty)
+    if generation == 5 {
+        return state
+            .gen5_map
+            .read()
+            .await
+            .get(&mac)
+            .map(|entry| entry.uart.clone())
+            .ok_or_else(|| AppError::Msg("Gen5 mapping is missing".into()));
+    }
+
+    let serial = serial.ok_or_else(|| AppError::Msg("serial is required".into()))?;
+    let channel = channel.ok_or_else(|| AppError::Msg("channel is required".into()))?;
+    let console = state
+        .usb_map
+        .read()
+        .await
+        .get(&(mac, serial.to_owned(), channel))
+        .cloned()
+        .ok_or_else(|| AppError::Msg("UART mapping not found".into()))?;
+    let split = console
+        .rfind(|character: char| !character.is_ascii_digit())
+        .ok_or_else(|| AppError::Msg("mapped UART has no numeric suffix".into()))?;
+    let number = console[split + 1..]
+        .parse::<u32>()
+        .map_err(|_| AppError::Msg("mapped UART has an invalid numeric suffix".into()))?;
+    checked_tty(&format!("{}{}", &console[..split + 1], number + 1))
 }
 
 async fn rtos_start(
@@ -2006,10 +2433,6 @@ async fn rtos_end(
             return error_response(error.to_string(), StatusCode::BAD_REQUEST);
         }
     };
-
-    if let Err(error) = state.hardware.board(&session_key, request.gen) {
-        return error_response(error.to_string(), StatusCode::BAD_REQUEST);
-    }
 
     let mut sessions = state.rtos_sessions.lock().await;
 
@@ -2294,8 +2717,6 @@ fn parse_power_state(value: &str) -> crate::error::AppResult<bool> {
 async fn mapped_power_tty(state: &AppState, supplied: &str) -> crate::error::AppResult<String> {
     let supplied = checked_tty(supplied)?;
     tracing::debug!(supplied_tty = %supplied, "validating supplied Gen5 power TTY");
-    state.hardware.power_allowed(&supplied)?;
-
     let entries: Vec<String> = state
         .gen5_map
         .read()
@@ -2323,10 +2744,12 @@ async fn mapped_power_tty(state: &AppState, supplied: &str) -> crate::error::App
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_uboot_mac, readiness_status, router, validated_mac};
+    use super::{
+        connection_type, disconnected_uart, eligible_uart_candidates, extract_uboot_mac,
+        readiness_status, router, validated_mac,
+    };
     use crate::{
         config::AppConfig,
-        hardware::HardwarePolicy,
         jobs::Jobs,
         models::Generation,
         relay::RelayController,
@@ -2338,6 +2761,79 @@ mod tests {
         sync::{atomic::AtomicBool, Arc},
     };
     use tokio::sync::{Mutex, RwLock};
+
+    #[test]
+    fn dynamic_uart_candidates_exclude_assigned_paths_and_the_active_relay() {
+        let devices = vec![
+            crate::usb::UsbTty {
+                tty: "/dev/ttyUSB0".into(),
+                vid: 0x10c4,
+                pid: 0xea60,
+                serial: Some("BOARD".into()),
+                interface: 0,
+                topology: "/sys/devices/1-2.3".into(),
+            },
+            crate::usb::UsbTty {
+                tty: "/dev/ttyUSB1".into(),
+                vid: 0x10c4,
+                pid: 0xea60,
+                serial: Some("ASSIGNED".into()),
+                interface: 0,
+                topology: "/sys/devices/1-2.4".into(),
+            },
+            crate::usb::UsbTty {
+                tty: "/dev/ttyUSB2".into(),
+                vid: 0x0403,
+                pid: 0x6001,
+                serial: Some("RELAY".into()),
+                interface: 0,
+                topology: "/sys/devices/1-2.5".into(),
+            },
+        ];
+        let used_paths = std::collections::HashSet::from(["/dev/ttyUSB1".to_owned()]);
+        let relay_identity = crate::relay::RelayIdentity {
+            serial_number: "RELAY".into(),
+            vid: 0x0403,
+            pid: 0x6001,
+        };
+
+        let candidates = eligible_uart_candidates(devices, &used_paths, &relay_identity);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].tty, "/dev/ttyUSB0");
+    }
+
+    #[test]
+    fn strict_uart_resolution_selects_only_the_disconnected_requested_topology() {
+        let requested = crate::usb::UsbTty {
+            tty: "/dev/ttyUSB0".into(),
+            vid: 0x0403,
+            pid: 0x6010,
+            serial: Some("TARGET".into()),
+            interface: 0,
+            topology: "/sys/devices/usb1/1-2/1-2.3".into(),
+        };
+        let other = crate::usb::UsbTty {
+            tty: "/dev/ttyUSB1".into(),
+            vid: 0x0403,
+            pid: 0x6010,
+            serial: Some("OTHER".into()),
+            interface: 0,
+            topology: "/sys/devices/usb1/1-2/1-2.4".into(),
+        };
+
+        let resolved = disconnected_uart(
+            &[requested.clone(), other.clone()],
+            &[other],
+            0x0403,
+            0x6010,
+            Some("/dev/ttyUSB0"),
+        )
+        .unwrap();
+
+        assert_eq!(resolved.unwrap().topology, requested.topology);
+        assert_eq!(connection_type(&requested.topology).unwrap(), "hub");
+    }
 
     fn test_state(features: FeatureFlags, generation: Generation) -> Arc<AppState> {
         Arc::new(AppState {
@@ -2356,13 +2852,13 @@ mod tests {
             }),
             usb_map: RwLock::new(HashMap::new()),
             gen5_map: RwLock::new(HashMap::new()),
+            uart_map: RwLock::new(HashMap::new()),
             rtos_sessions: Mutex::new(HashMap::new()),
             relay: RelayController::new(None).unwrap(),
             deletion_requested: AtomicBool::new(false),
             client: reqwest::Client::new(),
             jobs: Jobs::default(),
             api_token: None,
-            hardware: HardwarePolicy { boards: Vec::new() },
             features,
             registration_done: AtomicBool::new(false),
         })

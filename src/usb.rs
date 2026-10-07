@@ -10,7 +10,6 @@
 
 use crate::error::{AppError, AppResult};
 
-use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
     fs,
@@ -24,80 +23,6 @@ pub struct Gen5MapEntry {
     pub uart: String,
     pub power: String,
     pub mac: String,
-}
-
-/// Identity supplied by an administrator.
-///
-/// JSON numbers are decimal. For example:
-/// FTDI VID 0x0403 = 1027, PID 0x6010 = 24592.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct UsbIdentity {
-    pub vid: u16,
-    pub pid: u16,
-    pub serial: String,
-    pub interface: u8,
-
-    /// Optional USB topology hint used when multiple devices share the same
-    /// VID/PID/serial string behind a single hub or bridge.
-    ///
-    /// The value is matched against the canonical sysfs topology suffix, for
-    /// example `1-2.3` or a longer path suffix such as
-    /// `usb1/1-2/1-2.3`. This keeps the legacy identity format working while
-    /// allowing the hardware policy to disambiguate identical serials in the
-    /// real world.
-    #[serde(default)]
-    pub path: Option<String>,
-}
-
-impl UsbIdentity {
-    pub fn validate(&self) -> AppResult<()> {
-        if self.serial.is_empty()
-            || self.serial.len() > 255
-            || self.serial.chars().any(char::is_control)
-        {
-            return Err(AppError::Msg(
-                "USB identity requires a nonempty, valid serial descriptor".into(),
-            ));
-        }
-
-        if let Some(path) = &self.path {
-            let trimmed = path.trim();
-            if trimmed.is_empty() || trimmed.contains('\0') || trimmed.chars().any(char::is_control)
-            {
-                return Err(AppError::Msg(
-                    "USB topology path must be a nonempty, non-control sysfs suffix".into(),
-                ));
-            }
-        }
-
-        Ok(())
-    }
-
-    fn path_matches(&self, device: &UsbTty) -> bool {
-        let Some(path) = &self.path else {
-            return true;
-        };
-
-        let suffix = path.trim();
-        if suffix.is_empty() {
-            return true;
-        }
-
-        let topology = device.topology.to_string_lossy();
-        let normalized = suffix.strip_prefix('/').unwrap_or(suffix);
-        let with_leading = format!("/{normalized}");
-
-        topology.ends_with(normalized) || topology.ends_with(&with_leading)
-    }
-
-    pub fn matches(&self, device: &UsbTty) -> bool {
-        device.vid == self.vid
-            && device.pid == self.pid
-            && device.serial.as_deref() == Some(self.serial.as_str())
-            && device.interface == self.interface
-            && self.path_matches(device)
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -280,97 +205,6 @@ pub fn inventory() -> AppResult<Vec<UsbTty>> {
     Ok(devices)
 }
 
-fn select_identity(devices: &[UsbTty], identity: &UsbIdentity) -> AppResult<String> {
-    identity.validate()?;
-
-    let available = devices
-        .iter()
-        .map(|device| {
-            format!(
-                "tty={} vid={:04x} pid={:04x} serial={:?} interface={} path={}",
-                device.tty,
-                device.vid,
-                device.pid,
-                device.serial,
-                device.interface,
-                device.topology.display()
-            )
-        })
-        .collect::<Vec<_>>();
-
-    tracing::debug!(
-        requested_vid = identity.vid,
-        requested_pid = identity.pid,
-        requested_serial = %identity.serial,
-        requested_interface = identity.interface,
-        requested_path = ?identity.path,
-        device_count = devices.len(),
-        available_devices = ?available,
-        "checking live USB inventory against the requested USB identity"
-    );
-
-    let mut matches = devices.iter().filter(|device| identity.matches(device));
-
-    let first = matches.next().ok_or_else(|| {
-        tracing::warn!(
-            vid = identity.vid,
-            pid = identity.pid,
-            serial = %identity.serial,
-            interface = identity.interface,
-            available_devices = ?available,
-            "requested USB identity is unavailable"
-        );
-        AppError::Msg(format!(
-            "USB device {:04x}:{:04x}, serial {:?}, interface {} unavailable; available: {:?}",
-            identity.vid, identity.pid, identity.serial, identity.interface, available
-        ))
-    })?;
-
-    if matches.next().is_some() {
-        tracing::warn!(
-            vid = identity.vid,
-            pid = identity.pid,
-            serial = %identity.serial,
-            interface = identity.interface,
-            available_devices = ?available,
-            "USB identity is ambiguous; refusing to select a device"
-        );
-        return Err(AppError::Msg(
-            "USB identity is ambiguous; refusing to select a device".into(),
-        ));
-    }
-
-    tracing::info!(
-        tty = %first.tty,
-        vid = identity.vid,
-        pid = identity.pid,
-        serial = %identity.serial,
-        interface = identity.interface,
-        topology = %first.topology.display(),
-        "USB identity resolved to a live TTY"
-    );
-    Ok(first.tty.clone())
-}
-
-pub fn resolve_identity(identity: &UsbIdentity) -> AppResult<String> {
-    let inventory = inventory()?;
-
-    tracing::debug!(
-        vid = identity.vid,
-        pid = identity.pid,
-        serial = %identity.serial,
-        interface = identity.interface,
-        scanned_ttys = inventory.len(),
-        "resolving USB identity to a device node"
-    );
-
-    select_identity(&inventory, identity)
-}
-
-pub fn is_relay_identity(identity: &UsbIdentity) -> bool {
-    identity.vid == 0x0403 && identity.pid == 0x6001
-}
-
 fn inventory_paths(devices: &[UsbTty], vid: u16, pid: u16) -> Vec<String> {
     devices
         .iter()
@@ -447,16 +281,6 @@ mod tests {
         symlink(tty_path, class.join("device")).unwrap();
     }
 
-    fn identity(serial: &str, interface: u8) -> UsbIdentity {
-        UsbIdentity {
-            vid: 0x0403,
-            pid: 0x6010,
-            serial: serial.into(),
-            interface,
-            path: None,
-        }
-    }
-
     #[test]
     fn recognizes_only_numbered_usb_and_acm_names() {
         for accepted in ["ttyUSB0", "ttyUSB12", "ttyACM0"] {
@@ -476,48 +300,14 @@ mod tests {
 
         let devices = scan_at(&temp.path().join("class/tty"), Path::new("/dev")).unwrap();
 
-        assert_eq!(
-            select_identity(&devices, &identity("BOARD-A", 0)).unwrap(),
-            "/dev/ttyUSB8"
-        );
-        assert_eq!(
-            select_identity(&devices, &identity("BOARD-A", 1)).unwrap(),
-            "/dev/ttyUSB9"
-        );
+        assert_eq!(devices[0].tty, "/dev/ttyUSB8");
+        assert_eq!(devices[0].interface, 0);
+        assert_eq!(devices[1].tty, "/dev/ttyUSB9");
+        assert_eq!(devices[1].interface, 1);
         assert_eq!(
             inventory_paths(&devices, 0x0403, 0x6010),
             vec!["/dev/ttyUSB8"]
         );
-    }
-
-    #[test]
-    fn duplicate_usb_serial_identity_is_rejected_without_path_hint() {
-        let temp = tempfile::tempdir().unwrap();
-        fake_tty(temp.path(), "ttyUSB0", "1-2", 0, "DUPLICATE");
-        fake_tty(temp.path(), "ttyUSB1", "1-3", 0, "DUPLICATE");
-
-        let devices = scan_at(&temp.path().join("class/tty"), Path::new("/dev")).unwrap();
-
-        assert!(select_identity(&devices, &identity("DUPLICATE", 0)).is_err());
-    }
-
-    #[test]
-    fn duplicate_usb_serial_identity_can_be_resolved_by_topology_path() {
-        let temp = tempfile::tempdir().unwrap();
-        fake_tty(temp.path(), "ttyUSB0", "1-2.3", 0, "DUPLICATE");
-        fake_tty(temp.path(), "ttyUSB1", "1-2.4", 0, "DUPLICATE");
-
-        let devices = scan_at(&temp.path().join("class/tty"), Path::new("/dev")).unwrap();
-
-        let target = UsbIdentity {
-            vid: 0x0403,
-            pid: 0x6010,
-            serial: "DUPLICATE".into(),
-            interface: 0,
-            path: Some("1-2.3".into()),
-        };
-
-        assert_eq!(select_identity(&devices, &target).unwrap(), "/dev/ttyUSB0");
     }
 
     #[test]
@@ -527,7 +317,8 @@ mod tests {
 
         let devices = scan_at(&temp.path().join("class/tty"), Path::new("/dev")).unwrap();
 
-        assert!(select_identity(&devices, &identity("BOARD-A", 0)).is_err());
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].interface, 1);
         assert!(inventory_paths(&devices, 0x0403, 0x6010).is_empty());
     }
 }

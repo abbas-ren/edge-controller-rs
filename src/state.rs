@@ -1,12 +1,11 @@
 use crate::{
     config::*,
     error::{AppError, AppResult},
-    hardware::HardwarePolicy,
     jobs::Jobs,
     models::{RegistrationPayload, RelayInventory},
     observability::metrics::global_metrics,
     relay::{RelayController, RelaySelector},
-    store::{self, Gen5Mappings, UsbMappings},
+    store::{self, Gen5Mappings, UartMappings, UsbMappings},
     FeatureFlags,
 };
 
@@ -42,13 +41,13 @@ pub struct AppState {
     pub controller: RwLock<ControllerInfo>,
     pub usb_map: RwLock<UsbMappings>,
     pub gen5_map: RwLock<Gen5Mappings>,
+    pub uart_map: RwLock<UartMappings>,
     pub rtos_sessions: Mutex<HashMap<String, RtosSession>>,
     pub relay: RelayController,
     pub(crate) deletion_requested: AtomicBool,
     pub client: reqwest::Client,
     pub jobs: Jobs,
     pub api_token: Option<String>,
-    pub hardware: HardwarePolicy,
     pub features: FeatureFlags,
     pub registration_done: AtomicBool,
 }
@@ -69,8 +68,6 @@ impl AppState {
             .map_err(|_| AppError::Msg("controller interface IP is not IPv4".into()))?;
 
         let api_token = configured_api_token()?;
-        let hardware_path = configured_hardware_path()?;
-
         if api_token.as_ref().is_some_and(|token| {
             !(32..=256).contains(&token.len()) || !token.bytes().all(|byte| byte.is_ascii_graphic())
         }) {
@@ -83,29 +80,11 @@ impl AppState {
             ));
         }
 
-        if !Path::new(&hardware_path).is_absolute() {
-            tracing::error!(hardware_path = %hardware_path, "invalid hardware policy path rejected");
-            return Err(AppError::Msg(
-                "DEV_CONTROLLER_HARDWARE must be an absolute pathname".into(),
-            ));
-        }
-
-        let features_for_state = features.clone();
-        let (hardware, usb_map, gen5_map, uid) = tokio::task::spawn_blocking(move || {
-            tracing::info!(hardware_path = %hardware_path, "loading hardware policy and persisted state");
-
-            let hardware = HardwarePolicy::load_with_features(&hardware_path, &features_for_state)?;
-            tracing::info!(
-                board_count = hardware.boards.len(),
-                hardware_path = %hardware_path,
-                "hardware policy loaded and validated"
-            );
-
-            let (usb_map, gen5_map) = store::load_mappings(
-                Path::new(USB_MAPPING_FILE),
-                Path::new(GEN5_MAPPING_FILE),
-                &hardware,
-            )?;
+        let (usb_map, gen5_map, uart_map, uid) = tokio::task::spawn_blocking(move || {
+            tracing::info!("loading persisted controller state");
+            let (usb_map, gen5_map) =
+                store::load_mappings(Path::new(USB_MAPPING_FILE), Path::new(GEN5_MAPPING_FILE))?;
+            let uart_map = store::load_uart_mappings(Path::new(UART_MAPPING_FILE))?;
 
             let uid = store::load_uid(Path::new(UID_FILE))?;
 
@@ -124,7 +103,7 @@ impl AppState {
                 );
             }
 
-            Ok::<_, AppError>((hardware, usb_map, gen5_map, uid))
+            Ok::<_, AppError>((usb_map, gen5_map, uart_map, uid))
         })
         .await
         .map_err(|error| AppError::Msg(format!("state-loading worker failed: {error}")))??;
@@ -147,13 +126,13 @@ impl AppState {
             }),
             usb_map: RwLock::new(usb_map),
             gen5_map: RwLock::new(gen5_map),
+            uart_map: RwLock::new(uart_map),
             rtos_sessions: Mutex::new(HashMap::new()),
             relay,
             deletion_requested: AtomicBool::new(false),
             client,
             jobs: Jobs::default(),
             api_token,
-            hardware,
             features,
             registration_done: AtomicBool::new(false),
         });
@@ -238,8 +217,7 @@ impl AppState {
 mod tests {
     use super::{AppState, ControllerInfo};
     use crate::{
-        config::AppConfig, hardware::HardwarePolicy, jobs::Jobs, models::Generation,
-        relay::RelayController, FeatureFlags,
+        config::AppConfig, jobs::Jobs, models::Generation, relay::RelayController, FeatureFlags,
     };
     use std::{collections::HashMap, sync::atomic::AtomicBool};
     use tokio::sync::{Mutex, RwLock};
@@ -284,13 +262,13 @@ mod tests {
             }),
             usb_map: RwLock::new(HashMap::new()),
             gen5_map: RwLock::new(HashMap::new()),
+            uart_map: RwLock::new(HashMap::new()),
             rtos_sessions: Mutex::new(HashMap::new()),
             relay: RelayController::new(None).unwrap(),
             deletion_requested: AtomicBool::new(false),
             client: reqwest::Client::new(),
             jobs: Jobs::default(),
             api_token: None,
-            hardware: HardwarePolicy { boards: Vec::new() },
             features: FeatureFlags::default(),
             registration_done: AtomicBool::new(false),
         };

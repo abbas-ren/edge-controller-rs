@@ -10,15 +10,18 @@ The service reads the legacy `key=value` login configuration. Required keys are
 (default `8888`) and `iface_name` (default `eth0`). See
 `config/login.toml.example` for an example.
 
-Hardware bindings are loaded from `/etc/dev-controller/hardware.json` by
-default. `files/etc_dev-controller_hardware.json.sample` documents the expected
-shape. State mappings remain compatible with the legacy files under `/var/log`.
+Board bindings are discovered by physically probing the requested relay channel
+and persisted in the legacy mapping files under `/var/log`. Strict UART verification writes one
+generation-aware row per target device to `/etc/log/uart_mappings.csv`; the systemd unit provisions
+`/etc/log` with mode `0700` before starting the service.
+
+UART rows use `mac,generation,tty,vid,pid,usb_serial,interface,topology,connection,relay_serial,channel`.
+Gen5 rows store `-` for relay serial and channel because CPLD power control is used instead.
 
 Useful environment variables:
 
 - `DEV_CONTROLLER_BIND`: API socket address; defaults to `0.0.0.0:8888`.
 - `DEV_CONTROLLER_INTERFACE`: overrides the configured network interface.
-- `DEV_CONTROLLER_HARDWARE`: absolute hardware-policy path.
 - `DEV_CONTROLLER_TOKEN`: optional 32-256 character bearer token. Configure it
 	whenever the API is reachable outside a trusted network.
 
@@ -34,9 +37,8 @@ does not require relay or GPIO bindings.
 Gen3/Gen4 startup requires `--vid-pid <VID:PID>`. The optional
 `--relay-serial-number <iSerial>` is accepted only with `--vid-pid`. When the
 serial is omitted, exactly one matching USB relay must be connected so its
-iSerial can be resolved. The hardware policy
-assigns one `gpio` and one relay `channel` per board; relay identity is runtime
-configuration rather than static policy.
+iSerial can be resolved. Relay channel and GPIO assignments come from the
+FarmController configuration; relay identity is runtime configuration.
 
 Firmware requests configure resting `gpioDefaultLevel` and `relayDefaultLevel`
 values independently as `HIGH` or `LOW`; both default to `LOW`. With those
@@ -52,6 +54,11 @@ output. `--log-network` and `--log-stream` enable more detailed diagnostics for
 those subsystems. Request payloads, credentials, and backend message contents
 are not logged.
 
+`GET /logs?limit=500` returns the bounded in-memory structured event buffer.
+`PUT /logs/level` with `{"level":"debug"}` changes the active filter without a
+restart. Supported live levels are `trace`, `debug`, `info`, `warn`, `error`,
+and `off`. Existing and future `tracing` events use the reloaded filter.
+
 ## HTTP API
 
 The API and Prometheus endpoint share the controller listener (port `8888` by
@@ -60,7 +67,8 @@ default). When `DEV_CONTROLLER_TOKEN` is set, send
 
 Operational endpoints:
 
-- `GET /health`, `GET /ready`, `GET /status`, `GET /metrics`
+- `GET /health`, `GET /ready`, `GET /status`, `GET /metrics`, `GET /logs`
+- `PUT /logs/level`
 - `GET /swagger.json`, `GET /docs`
 - `POST /confirmation`
 
@@ -142,8 +150,7 @@ selector, enabled generations, RTOS capture, or other CLI options in
 EDGE_CONTROLLER_ARGS="--enable-gen4 --relay-serial-number AB0OFAFX --vid-pid 0403:6001 --log-file /var/log/edgecontroller.log"
 ```
 
-Install the login configuration at `/etc/config/login.cfg`, the hardware policy
-at `/etc/dev-controller/hardware.json`, and firmware under
+Install the login configuration at `/etc/config/login.cfg` and firmware under
 `/var/lib/dev-controller/firmware`. The service runs with filesystem hardening
 but retains host device access for GPIO, USB relays, and serial interfaces.
 Shutdown has no forced timeout because accepted firmware jobs must retain their

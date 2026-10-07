@@ -21,6 +21,7 @@ pub const GEN5_POWER_TTY: &str = "/var/log/gen5_power.csv";
 pub const GEN5_UART_TTY: &str = "/var/log/gen5_uart.csv";
 pub const USB_MAPPING_FILE: &str = "/var/log/usb_mapping.csv";
 pub const GEN5_MAPPING_FILE: &str = "/var/log/gen5_mapping.csv";
+pub const UART_MAPPING_FILE: &str = "/etc/log/uart_mappings.csv";
 
 const MAX_CONFIG_BYTES: usize = 16 * 1024;
 
@@ -232,29 +233,6 @@ pub fn configured_api_token() -> AppResult<Option<String>> {
     }
 
     Ok(token)
-}
-
-pub fn configured_hardware_path() -> AppResult<String> {
-    let path = optional_environment("DEV_CONTROLLER_HARDWARE")?.unwrap_or_else(|| {
-        tracing::info!(
-            default_path = "/etc/dev-controller/hardware.json",
-            "DEV_CONTROLLER_HARDWARE unset; using default hardware policy path"
-        );
-        "/etc/dev-controller/hardware.json".into()
-    });
-
-    if !Path::new(&path).is_absolute() {
-        tracing::error!(
-            configured_path = %path,
-            "DEV_CONTROLLER_HARDWARE is not absolute; rejecting invalid path"
-        );
-        return Err(AppError::Msg(
-            "DEV_CONTROLLER_HARDWARE must be an absolute pathname".into(),
-        ));
-    }
-
-    tracing::info!(hardware_path = %path, "hardware policy path selected");
-    Ok(path)
 }
 
 #[cfg(test)]

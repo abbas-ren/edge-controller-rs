@@ -6,9 +6,7 @@ use std::{
 };
 use tracing::{info, warn};
 
-use crate::{
-    config, hardware, models, observability::metrics::global_metrics, state::AppState, store,
-};
+use crate::{config, models, observability::metrics::global_metrics, state::AppState, store};
 
 /// Read the selected interface's MAC and IPv4 address.
 ///
@@ -144,7 +142,6 @@ pub async fn stop_captures(state: &AppState) {
 pub fn check_offline(
     cfg: &config::AppConfig,
     config_path: &str,
-    hardware_path: &str,
     bind_address: SocketAddr,
     authentication_enabled: bool,
 ) -> Result<()> {
@@ -156,6 +153,7 @@ pub fn check_offline(
         config::UID_FILE,
         config::USB_MAPPING_FILE,
         config::GEN5_MAPPING_FILE,
+        config::UART_MAPPING_FILE,
     ] {
         let parent = Path::new(filename)
             .parent()
@@ -172,15 +170,13 @@ pub fn check_offline(
         }
     }
 
-    let policy =
-        hardware::HardwarePolicy::load(hardware_path).context("validating hardware policy")?;
-
     let (usb, gen5) = store::load_mappings(
         Path::new(config::USB_MAPPING_FILE),
         Path::new(config::GEN5_MAPPING_FILE),
-        &policy,
     )
     .context("validating persisted mappings")?;
+    let uart = store::load_uart_mappings(Path::new(config::UART_MAPPING_FILE))
+        .context("validating persisted UART mappings")?;
 
     let uid = store::load_uid(Path::new(config::UID_FILE))
         .context("validating persisted controller ID")?;
@@ -188,14 +184,13 @@ pub fn check_offline(
     let report = serde_json::json!({
         "status": "valid",
         "configuration": config_path,
-        "hardware_policy": hardware_path,
         "generation": cfg.gen.as_int(),
         "interface": cfg.iface_name,
         "listen_address": bind_address.to_string(),
         "authentication_enabled": authentication_enabled,
-        "approved_boards": policy.boards.len(),
         "usb_mapping_count": usb.len(),
         "gen5_mapping_count": gen5.len(),
+        "uart_mapping_count": uart.len(),
         "controller_id_present": uid.is_some(),
         "hardware_checked": false,
         "network_checked": false,
@@ -213,7 +208,6 @@ mod tests {
     use crate::{
         cli::FeatureFlags,
         config::AppConfig,
-        hardware::HardwarePolicy,
         jobs::Jobs,
         models::Generation,
         relay::RelayController,
@@ -277,13 +271,13 @@ mod tests {
             }),
             usb_map: RwLock::new(HashMap::new()),
             gen5_map: RwLock::new(HashMap::new()),
+            uart_map: RwLock::new(HashMap::new()),
             rtos_sessions: Mutex::new(HashMap::new()),
             relay: RelayController::new(None).unwrap(),
             deletion_requested: AtomicBool::new(false),
             client: reqwest::Client::new(),
             jobs: Jobs::default(),
             api_token: None,
-            hardware: HardwarePolicy { boards: Vec::new() },
             features: FeatureFlags::default(),
             registration_done: AtomicBool::new(false),
         });

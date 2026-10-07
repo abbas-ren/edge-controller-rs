@@ -9,7 +9,6 @@
 
 use crate::{
     error::{AppError, AppResult},
-    hardware::HardwarePolicy,
     usb::Gen5MapEntry,
 };
 
@@ -25,6 +24,22 @@ use nix::libc;
 
 pub type UsbMappings = HashMap<(String, String, u8), String>;
 pub type Gen5Mappings = HashMap<String, Gen5MapEntry>;
+pub type UartMappings = HashMap<String, UartMapping>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UartMapping {
+    pub mac: String,
+    pub generation: u8,
+    pub tty: String,
+    pub vid: u16,
+    pub pid: u16,
+    pub usb_serial: Option<String>,
+    pub interface: u8,
+    pub topology: String,
+    pub connection: String,
+    pub relay_serial: String,
+    pub channel: u8,
+}
 
 pub const MAX_STATE_BYTES: usize = 1024 * 1024;
 const MAX_ROWS: usize = 4096;
@@ -336,19 +351,96 @@ pub fn parse_gen5(text: &str) -> AppResult<Gen5Mappings> {
     Ok(mappings)
 }
 
-/// Validate both files together and against approved wiring.
+pub fn parse_uart(text: &str) -> AppResult<UartMappings> {
+    let mut mappings = UartMappings::new();
+    let mut ttys = HashSet::new();
+
+    for fields in parse_rows(text, 11)? {
+        let mac = checked_mac(fields[0])?;
+        let generation = fields[1]
+            .parse::<u8>()
+            .ok()
+            .filter(|generation| matches!(generation, 3..=5))
+            .ok_or_else(|| invalid("UART mapping generation must be 3, 4, or 5"))?;
+        validate_tty(fields[2])?;
+        let parse_hex = |value: &str, field: &str| {
+            (value.len() == 4 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                .then(|| u16::from_str_radix(value, 16).ok())
+                .flatten()
+                .ok_or_else(|| invalid(format!("UART mapping {field} must be four hex digits")))
+        };
+        let vid = parse_hex(fields[3], "VID")?;
+        let pid = parse_hex(fields[4], "PID")?;
+        let usb_serial = (fields[5] != "-").then(|| fields[5].to_owned());
+        if usb_serial.as_ref().is_some_and(|value| {
+            value.len() > 255
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b',' | b'"'))
+        }) {
+            return Err(invalid("invalid UART USB serial"));
+        }
+        let interface = fields[6]
+            .parse::<u8>()
+            .map_err(|_| invalid("UART interface must be 0..255"))?;
+        if !fields[7].starts_with('/') || fields[7].chars().any(char::is_control) {
+            return Err(invalid("UART topology must be an absolute, printable path"));
+        }
+        if !matches!(fields[8], "standalone" | "hub") {
+            return Err(invalid("UART connection must be standalone or hub"));
+        }
+        let relay_serial = if generation != 5 { fields[9] } else { "-" };
+        if generation != 5 {
+            validate_serial(relay_serial)?;
+        } else if fields[9] != "-" || fields[10] != "-" {
+            return Err(invalid(
+                "Gen5 UART mappings cannot contain relay information",
+            ));
+        }
+        let channel = if generation == 5 {
+            0
+        } else {
+            fields[10]
+                .parse::<u8>()
+                .ok()
+                .filter(|channel| *channel <= 7)
+                .ok_or_else(|| invalid("UART relay channel must be 0..7"))?
+        };
+
+        if mappings.contains_key(&mac) || !ttys.insert(fields[2].to_owned()) {
+            return Err(invalid("duplicate target MAC or UART TTY in mappings"));
+        }
+
+        mappings.insert(
+            mac.clone(),
+            UartMapping {
+                mac,
+                generation,
+                tty: fields[2].to_owned(),
+                vid,
+                pid,
+                usb_serial,
+                interface,
+                topology: fields[7].to_owned(),
+                connection: fields[8].to_owned(),
+                relay_serial: relay_serial.to_owned(),
+                channel,
+            },
+        );
+    }
+
+    Ok(mappings)
+}
+
+/// Validate both persisted mapping files together.
 ///
 /// No sysfs access occurs here. Offline or powered-off devices must not
 /// prevent loading structurally valid persisted state.
-pub fn validate_snapshot(
-    usb: &UsbMappings,
-    gen5: &Gen5Mappings,
-    policy: &HardwarePolicy,
-) -> AppResult<()> {
+pub fn validate_snapshot(usb: &UsbMappings, gen5: &Gen5Mappings) -> AppResult<()> {
     tracing::debug!(
         usb_count = usb.len(),
         gen5_count = gen5.len(),
-        "validating persisted USB and Gen5 mappings against hardware policy"
+        "validating persisted USB and Gen5 mappings"
     );
 
     // Reparse the serialized form to enforce the same rules for in-memory
@@ -359,34 +451,7 @@ pub fn validate_snapshot(
     let mut used_devices = HashSet::new();
     let mut used_macs = HashSet::new();
 
-    for ((mac, serial, channel), tty) in &parsed_usb {
-        let board = policy
-            .boards
-            .iter()
-            .find(|board| board.mac == *mac && matches!(board.gen, 3 | 4))
-            .ok_or_else(|| {
-                tracing::warn!(mac = %mac, tty = %tty, "persisted USB mapping references an unapproved board");
-                invalid("persisted USB mapping references an unapproved board")
-            })?;
-
-        let relay = board.relay.as_ref().ok_or_else(|| {
-            tracing::warn!(mac = %mac, "approved board is missing a relay binding");
-            invalid("approved board lacks a relay binding")
-        })?;
-
-        if relay.channel != *channel {
-            tracing::warn!(
-                mac = %mac,
-                stored_serial = %serial,
-                stored_channel = channel,
-                approved_channel = relay.channel,
-                "persisted relay channel differs from approved wiring"
-            );
-            return Err(invalid(
-                "persisted relay channel differs from approved wiring",
-            ));
-        }
-
+    for ((mac, _, _), tty) in &parsed_usb {
         if !used_devices.insert(tty.clone()) || !used_macs.insert(mac.clone()) {
             tracing::warn!(mac = %mac, tty = %tty, "conflicting persisted USB mapping detected");
             return Err(invalid("conflicting persisted USB mapping"));
@@ -394,11 +459,6 @@ pub fn validate_snapshot(
     }
 
     for (mac, entry) in &parsed_gen5 {
-        if let Err(error) = policy.board(mac, 5) {
-            tracing::warn!(mac = %mac, error = %error, "Gen5 mapping references an unapproved board");
-            return Err(error);
-        }
-
         if !used_macs.insert(mac.clone())
             || !used_devices.insert(entry.uart.clone())
             || !used_devices.insert(entry.power.clone())
@@ -416,11 +476,7 @@ pub fn validate_snapshot(
     Ok(())
 }
 
-pub fn load_mappings(
-    usb_path: &Path,
-    gen5_path: &Path,
-    policy: &HardwarePolicy,
-) -> AppResult<(UsbMappings, Gen5Mappings)> {
+pub fn load_mappings(usb_path: &Path, gen5_path: &Path) -> AppResult<(UsbMappings, Gen5Mappings)> {
     let usb_text = read_optional_text(usb_path, MAX_STATE_BYTES)?.unwrap_or_default();
     let gen5_text = read_optional_text(gen5_path, MAX_STATE_BYTES)?.unwrap_or_default();
 
@@ -450,7 +506,7 @@ pub fn load_mappings(
             invalid(format!("invalid {}: {error}", gen5_path.display()))
         })?;
 
-    validate_snapshot(&usb, &gen5, policy)?;
+    validate_snapshot(&usb, &gen5)?;
 
     tracing::info!(
         usb_mappings = usb.len(),
@@ -458,6 +514,11 @@ pub fn load_mappings(
         "persisted mappings loaded and verified"
     );
     Ok((usb, gen5))
+}
+
+pub fn load_uart_mappings(path: &Path) -> AppResult<UartMappings> {
+    let text = read_optional_text(path, MAX_STATE_BYTES)?.unwrap_or_default();
+    parse_uart(&text).map_err(|error| invalid(format!("invalid {}: {error}", path.display())))
 }
 
 pub fn encode_usb(mappings: &UsbMappings) -> AppResult<String> {
@@ -494,6 +555,53 @@ pub fn encode_gen5(mappings: &Gen5Mappings) -> AppResult<String> {
 
     rows.sort_unstable();
     Ok(rows.concat())
+}
+
+pub fn encode_uart(mappings: &UartMappings) -> AppResult<String> {
+    let mut rows = Vec::with_capacity(mappings.len());
+
+    for (mac, mapping) in mappings {
+        if mac != &mapping.mac {
+            return Err(invalid("UART mapping key does not match its MAC"));
+        }
+        for value in [
+            mapping.usb_serial.as_deref().unwrap_or("-"),
+            mapping.topology.as_str(),
+            mapping.connection.as_str(),
+            mapping.relay_serial.as_str(),
+        ] {
+            if value.is_empty() || value.contains(',') || value.chars().any(char::is_control) {
+                return Err(invalid("UART mapping contains an invalid CSV field"));
+            }
+        }
+        rows.push(format!(
+            "{},{},{},{:04x},{:04x},{},{},{},{},{},{}\n",
+            mapping.mac,
+            mapping.generation,
+            mapping.tty,
+            mapping.vid,
+            mapping.pid,
+            mapping.usb_serial.as_deref().unwrap_or("-"),
+            mapping.interface,
+            mapping.topology,
+            mapping.connection,
+            if mapping.generation == 5 {
+                "-"
+            } else {
+                &mapping.relay_serial
+            },
+            if mapping.generation == 5 {
+                "-".to_owned()
+            } else {
+                mapping.channel.to_string()
+            },
+        ));
+    }
+
+    rows.sort_unstable();
+    let encoded = rows.concat();
+    parse_uart(&encoded)?;
+    Ok(encoded)
 }
 
 /// Atomically replace one file, then attempt to synchronize its directory.
@@ -635,6 +743,48 @@ mod tests {
     }
 
     #[test]
+    fn uart_mapping_round_trip_preserves_topology_and_connection() {
+        let mapping = UartMapping {
+            mac: "aabbccddeeff".into(),
+            generation: 4,
+            tty: "/dev/ttyUSB2".into(),
+            vid: 0x0403,
+            pid: 0x6010,
+            usb_serial: Some("UART-A".into()),
+            interface: 1,
+            topology: "/sys/devices/pci0000:00/usb1/1-2/1-2.3".into(),
+            connection: "hub".into(),
+            relay_serial: "RELAY-A".into(),
+            channel: 0,
+        };
+        let mappings = UartMappings::from([(mapping.mac.clone(), mapping.clone())]);
+
+        let encoded = encode_uart(&mappings).unwrap();
+
+        assert_eq!(
+            parse_uart(&encoded).unwrap().get(&mapping.mac),
+            Some(&mapping)
+        );
+    }
+
+    #[test]
+    fn gen5_uart_mapping_records_generation_without_relay_fields() {
+        let text =
+            "aabbccddeeff,5,/dev/ttyACM0,1234,abcd,-,0,/sys/devices/usb1/1-2,standalone,-,-\n";
+
+        let parsed = parse_uart(text).unwrap();
+        let mapping = parsed.get("aabbccddeeff").unwrap();
+
+        assert_eq!(mapping.generation, 5);
+        assert_eq!(mapping.relay_serial, "-");
+        assert_eq!(encode_uart(&parsed).unwrap(), text);
+        assert!(parse_uart(
+            "aabbccddeeff,5,/dev/ttyACM0,1234,abcd,-,0,/sys/devices/usb1/1-2,standalone,RELAY,0\n"
+        )
+        .is_err());
+    }
+
+    #[test]
     fn malformed_channel_never_defaults_to_zero() {
         for channel in ["", "-1", "8", "03", "0x1", "one", "1tail"] {
             assert!(parse_usb(&format!("/dev/ttyUSB0,aabbccddeeff,R,{channel}\n")).is_err());
@@ -729,108 +879,49 @@ mod tests {
         assert!(load_uid(&path).unwrap().is_none());
     }
 
-    fn test_policy() -> HardwarePolicy {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("hardware.json");
-
-        fs::write(
-            &path,
-            serde_json::json!({
-                "boards": [
-                    {
-                        "mac": "aabbccddee01",
-                        "gen": 4,
-                        "uart": {
-                            "vid": 1027,
-                            "pid": 24592,
-                            "serial": "UART4",
-                            "interface": 0
-                        },
-                        "relay": {
-                            "channel": 0
-                        },
-                        "gpio": 17
-                    },
-                    {
-                        "mac": "aabbccddee02",
-                        "gen": 5,
-                        "uart": {
-                            "vid": 1027,
-                            "pid": 24592,
-                            "serial": "UART5",
-                            "interface": 0
-                        },
-                        "power": {
-                            "vid": 4292,
-                            "pid": 60000,
-                            "serial": "POWER5",
-                            "interface": 0
-                        }
-                    }
-                ]
-            })
-            .to_string(),
-        )
-        .unwrap();
-
-        HardwarePolicy::load(path.to_str().unwrap()).unwrap()
-    }
-
     #[test]
     fn valid_cross_file_snapshot_does_not_require_connected_hardware() {
-        let policy = test_policy();
-
         let usb = parse_usb("/dev/ttyUSB0,aabbccddee01,RELAY-A,0\n").unwrap();
 
         let gen5 = parse_gen5("/dev/ttyUSB2,/dev/ttyUSB3,aabbccddee02\n").unwrap();
 
         // These paths are validated syntactically. No /dev or sysfs lookup
         // should occur during persisted-state loading.
-        validate_snapshot(&usb, &gen5, &policy).unwrap();
+        validate_snapshot(&usb, &gen5).unwrap();
     }
 
     #[test]
     fn cross_file_device_collision_is_rejected() {
-        let policy = test_policy();
-
         let usb = parse_usb("/dev/ttyUSB0,aabbccddee01,RELAY-A,0\n").unwrap();
 
         // Gen5 attempts to reuse the Gen4 console as its power interface.
         let gen5 = parse_gen5("/dev/ttyUSB2,/dev/ttyUSB0,aabbccddee02\n").unwrap();
 
-        assert!(validate_snapshot(&usb, &gen5, &policy).is_err());
+        assert!(validate_snapshot(&usb, &gen5).is_err());
     }
 
     #[test]
-    fn persisted_relay_channel_must_match_policy_and_serial_is_dynamic() {
-        let policy = test_policy();
+    fn persisted_relay_mapping_does_not_require_policy_wiring() {
+        let dynamic_channel = parse_usb("/dev/ttyUSB0,aabbccddee01,RELAY-A,1\n").unwrap();
 
-        let wrong_channel = parse_usb("/dev/ttyUSB0,aabbccddee01,RELAY-A,1\n").unwrap();
+        let dynamic_serial = parse_usb("/dev/ttyUSB0,aabbccddee01,OTHER-RELAY,0\n").unwrap();
 
-        let wrong_serial = parse_usb("/dev/ttyUSB0,aabbccddee01,OTHER-RELAY,0\n").unwrap();
-
-        assert!(validate_snapshot(&wrong_channel, &Gen5Mappings::new(), &policy,).is_err());
-
-        validate_snapshot(&wrong_serial, &Gen5Mappings::new(), &policy).unwrap();
+        validate_snapshot(&dynamic_channel, &Gen5Mappings::new()).unwrap();
+        validate_snapshot(&dynamic_serial, &Gen5Mappings::new()).unwrap();
     }
 
     #[test]
-    fn unapproved_board_is_rejected() {
-        let policy = test_policy();
-
+    fn persisted_relay_mapping_accepts_a_dynamically_discovered_board() {
         let usb = parse_usb("/dev/ttyUSB0,aabbccddee99,RELAY-A,0\n").unwrap();
 
-        assert!(validate_snapshot(&usb, &Gen5Mappings::new(), &policy).is_err());
+        validate_snapshot(&usb, &Gen5Mappings::new()).unwrap();
     }
 
     #[test]
-    fn mapping_generation_must_match_policy() {
-        let policy = test_policy();
-
-        // This MAC is approved as Gen4, not Gen5.
+    fn persisted_gen5_mapping_accepts_a_dynamically_discovered_board() {
         let gen5 = parse_gen5("/dev/ttyUSB2,/dev/ttyUSB3,aabbccddee01\n").unwrap();
 
-        assert!(validate_snapshot(&UsbMappings::new(), &gen5, &policy).is_err());
+        validate_snapshot(&UsbMappings::new(), &gen5).unwrap();
     }
 
     #[test]
@@ -845,7 +936,7 @@ mod tests {
         fs::write(&usb_path, usb_contents).unwrap();
         fs::write(&gen5_path, bad_gen5_contents).unwrap();
 
-        let result = load_mappings(&usb_path, &gen5_path, &test_policy());
+        let result = load_mappings(&usb_path, &gen5_path);
 
         assert!(result.is_err());
 
@@ -861,7 +952,6 @@ mod tests {
         let (usb, gen5) = load_mappings(
             &directory.path().join("missing-usb.csv"),
             &directory.path().join("missing-gen5.csv"),
-            &test_policy(),
         )
         .unwrap();
 
@@ -876,12 +966,7 @@ mod tests {
 
         fs::create_dir(&usb_path).unwrap();
 
-        assert!(load_mappings(
-            &usb_path,
-            &directory.path().join("missing-gen5.csv"),
-            &test_policy(),
-        )
-        .is_err());
+        assert!(load_mappings(&usb_path, &directory.path().join("missing-gen5.csv"),).is_err());
     }
 
     #[test]

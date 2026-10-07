@@ -11,7 +11,6 @@ const ENVIRONMENT_HELP: &str = "Environment overrides:
     DEV_CONTROLLER_LOG_STREAM    Enable stream logging with 1/true/yes/on
     DEV_CONTROLLER_BIND          Set the controller API listen address
     DEV_CONTROLLER_INTERFACE     Override the configured network interface
-    DEV_CONTROLLER_HARDWARE      Set the hardware-policy path
     DEV_CONTROLLER_TOKEN         Set the API bearer token";
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]

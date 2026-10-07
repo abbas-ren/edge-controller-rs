@@ -81,6 +81,30 @@ pub struct RelayConfigRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UartConfigRequest {
+    pub mac: String,
+    pub gen: u8,
+    pub vid_pid: String,
+    pub serial: Option<String>,
+    pub channel: Option<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UartConfigResponse {
+    pub mac: String,
+    pub generation: u8,
+    pub vid_pid: String,
+    pub tty: String,
+    pub usb_serial: Option<String>,
+    pub interface: u8,
+    pub topology: String,
+    pub connection: String,
+    pub verified: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeleteRequest {
     #[serde(default = "default_relay_generation")]
     pub gen: u8,

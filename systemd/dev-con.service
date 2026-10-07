@@ -23,7 +23,9 @@ ProtectKernelTunables=true
 ProtectSystem=strict
 StateDirectory=dev-controller
 StateDirectoryMode=0750
-ReadWritePaths=/var/lib/dev-controller /var/log
+ConfigurationDirectory=log
+ConfigurationDirectoryMode=0700
+ReadWritePaths=/var/lib/dev-controller /var/log /etc/log
 UMask=0077
 
 [Install]

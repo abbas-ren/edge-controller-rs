@@ -5,7 +5,11 @@ use std::{
     sync::OnceLock,
 };
 
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+mod runtime;
+
+pub use runtime::{current_level, recent, set_level};
 
 static FILE_LOG_GUARD: OnceLock<tracing_appender::non_blocking::WorkerGuard> = OnceLock::new();
 
@@ -96,6 +100,8 @@ pub fn init_logging(
 ) -> Result<()> {
     let options = LogOptions::from_cli(log_level, log_file, network_logging, stream_logging);
     let filter = logging_filter(&options);
+    let initial_level = options.level.as_deref().unwrap_or("info");
+    let (filter, capture, runtime_control) = runtime::prepare(filter, initial_level);
 
     if let Some(file_path) = &options.file_path {
         let directory = file_path
@@ -111,13 +117,18 @@ pub fn init_logging(
 
         let file = tracing_appender::rolling::never(directory, filename);
         let (non_blocking, guard) = tracing_appender::non_blocking(file);
-        fmt()
-            .with_env_filter(filter.clone())
-            .with_writer(non_blocking)
-            .with_ansi(false)
-            .compact()
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(capture)
+            .with(
+                fmt::layer()
+                    .with_writer(non_blocking)
+                    .with_ansi(false)
+                    .compact(),
+            )
             .try_init()
             .map_err(|error| anyhow!("installing file log subscriber: {error}"))?;
+        runtime::install(runtime_control)?;
         FILE_LOG_GUARD
             .set(guard)
             .map_err(|_| anyhow!("file log worker guard was already installed"))?;
@@ -130,13 +141,18 @@ pub fn init_logging(
         return Ok(());
     }
 
-    fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .with_target(false)
-        .compact()
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(capture)
+        .with(
+            fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_target(false)
+                .compact(),
+        )
         .try_init()
         .map_err(|error| anyhow!("installing console log subscriber: {error}"))?;
+    runtime::install(runtime_control)?;
 
     if options.network_logging {
         tracing::info!("network logging enabled");
