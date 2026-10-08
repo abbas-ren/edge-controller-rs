@@ -104,6 +104,15 @@ pub async fn action(
 
 async fn snapshot(state: &AppState) -> serde_json::Value {
     let settings = control::current();
+    let gpio_header_pins = crate::gpio::HEADER_PINS
+        .iter()
+        .map(|(physical_pin, line_offset)| {
+            serde_json::json!({
+                "physicalPin": physical_pin,
+                "lineOffset": line_offset
+            })
+        })
+        .collect::<Vec<_>>();
     let active_token = state.api_token.read().await;
     let controller = state.controller.read().await;
     let active_paths = control::paths();
@@ -135,6 +144,12 @@ async fn snapshot(state: &AppState) -> serde_json::Value {
         },
         "hardware": {
             "generation": settings.generation,
+            "raspberryPiModel": settings.raspberry_pi_model,
+            "gpioHeaderProfile": {
+                "model": settings.raspberry_pi_model,
+                "chip": crate::gpio::default_device(settings.raspberry_pi_model),
+                "pins": gpio_header_pins
+            },
             "relaySerialNumber": settings.relay_serial_number,
             "relayVidPid": settings.relay_vid_pid
         },
@@ -169,6 +184,7 @@ async fn snapshot(state: &AppState) -> serde_json::Value {
         ],
         "constraints": {
             "authTokenLength": {"min": 32, "max": 256},
+            "raspberryPiModels": [4, 5],
             "mappingRoots": ["/var/log", "/var/lib/dev-controller", "/etc/log"],
             "restartService": "dev-con.service"
         }

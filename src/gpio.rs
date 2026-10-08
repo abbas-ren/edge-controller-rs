@@ -4,6 +4,46 @@ use crate::error::{AppError, AppResult};
 use gpio_cdev::{Chip, LineHandle, LineRequestFlags};
 use std::sync::Mutex;
 
+/// Usable 40-pin header positions and their gpiochip line offsets.
+pub const HEADER_PINS: [(u8, u8); 28] = [
+    (3, 2),
+    (5, 3),
+    (7, 4),
+    (8, 14),
+    (10, 15),
+    (11, 17),
+    (12, 18),
+    (13, 27),
+    (15, 22),
+    (16, 23),
+    (18, 24),
+    (19, 10),
+    (21, 9),
+    (22, 25),
+    (23, 11),
+    (24, 8),
+    (26, 7),
+    (27, 0),
+    (28, 1),
+    (29, 5),
+    (31, 6),
+    (32, 12),
+    (33, 13),
+    (35, 19),
+    (36, 16),
+    (37, 26),
+    (38, 20),
+    (40, 21),
+];
+
+/// Return the conventional GPIO character device for a Raspberry Pi model.
+pub fn default_device(raspberry_pi_model: u8) -> &'static str {
+    match raspberry_pi_model {
+        5 => "/dev/gpiochip4",
+        _ => "/dev/gpiochip0",
+    }
+}
+
 /// Retaining the LineHandle retains ownership of the GPIO output line.
 pub struct RequestedLine {
     offset: u32,
@@ -40,8 +80,9 @@ impl GpioController {
 
         *line = None;
 
-        let device =
-            std::env::var("DEV_CONTROLLER_GPIOCHIP").unwrap_or_else(|_| "/dev/gpiochip0".into());
+        let device = std::env::var("DEV_CONTROLLER_GPIOCHIP").unwrap_or_else(|_| {
+            default_device(crate::control::current().raspberry_pi_model).into()
+        });
 
         let mut chip =
             Chip::new(device).map_err(|e| AppError::Msg(format!("GPIO open failed: {e}")))?;
@@ -74,7 +115,15 @@ impl GpioController {
 
 #[cfg(test)]
 mod tests {
-    use super::GpioController;
+    use super::{default_device, GpioController, HEADER_PINS};
+
+    #[test]
+    fn profiles_use_expected_gpio_devices_and_header_offsets() {
+        assert_eq!(default_device(4), "/dev/gpiochip0");
+        assert_eq!(default_device(5), "/dev/gpiochip4");
+        assert!(HEADER_PINS.contains(&(11, 17)));
+        assert!(HEADER_PINS.contains(&(40, 21)));
+    }
 
     #[test]
     fn stopping_without_requested_lines_is_idempotent() {

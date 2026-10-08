@@ -51,6 +51,7 @@ pub struct ControlSettings {
     pub http_port: u16,
     pub ws_port: u16,
     pub generation: u8,
+    pub raspberry_pi_model: u8,
     pub enable_gen3: bool,
     pub enable_gen4: bool,
     pub enable_gen5: bool,
@@ -79,6 +80,7 @@ impl Default for ControlSettings {
             http_port: 5000,
             ws_port: 5002,
             generation: 4,
+            raspberry_pi_model: 4,
             enable_gen3: false,
             enable_gen4: false,
             enable_gen5: false,
@@ -109,6 +111,7 @@ pub struct ControlPatch {
     pub http_port: Option<u16>,
     pub ws_port: Option<u16>,
     pub generation: Option<u8>,
+    pub raspberry_pi_model: Option<u8>,
     pub enable_gen3: Option<bool>,
     pub enable_gen4: Option<bool>,
     pub enable_gen5: Option<bool>,
@@ -215,6 +218,7 @@ pub fn apply(patch: ControlPatch) -> AppResult<ControlSettings> {
     replace_restart!(http_port);
     replace_restart!(ws_port);
     replace_restart!(generation);
+    replace_restart!(raspberry_pi_model);
     replace_restart!(enable_gen3);
     replace_restart!(enable_gen4);
     replace_restart!(enable_gen5);
@@ -284,6 +288,9 @@ pub fn validate(settings: &ControlSettings) -> AppResult<()> {
     crate::config::validate_interface(&settings.interface)?;
     if !matches!(settings.generation, 3..=5) {
         return Err(AppError::Msg("generation must be 3, 4, or 5".into()));
+    }
+    if !matches!(settings.raspberry_pi_model, 4 | 5) {
+        return Err(AppError::Msg("raspberryPiModel must be 4 or 5".into()));
     }
     if !matches!(
         settings.log_level.as_str(),
@@ -375,8 +382,18 @@ mod tests {
         let settings = ControlSettings::default();
         assert!(!settings.auth_enabled);
         assert!(settings.api_token.is_none());
+        assert_eq!(settings.raspberry_pi_model, 4);
         assert_eq!(settings.paths.uart, PathBuf::from(UART_MAPPING_FILE));
         validate(&settings).unwrap();
+    }
+
+    #[test]
+    fn rejects_unsupported_raspberry_pi_models() {
+        let settings = ControlSettings {
+            raspberry_pi_model: 3,
+            ..ControlSettings::default()
+        };
+        assert!(validate(&settings).is_err());
     }
 
     #[test]
