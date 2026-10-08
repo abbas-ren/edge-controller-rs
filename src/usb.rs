@@ -219,8 +219,7 @@ fn inventory_paths(devices: &[UsbTty], vid: u16, pid: u16) -> Vec<String> {
 ///
 /// The two inventory files are diagnostic snapshots, not transactional
 /// authoritative mappings.
-fn write_inventory(path: &str, lines: &[String]) -> AppResult<()> {
-    let path = Path::new(path);
+fn write_inventory(path: &Path, lines: &[String]) -> AppResult<()> {
     let parent = path
         .parent()
         .ok_or_else(|| AppError::Msg("inventory file has no parent directory".into()))?;
@@ -249,8 +248,9 @@ pub fn discover_gen5_ttys() -> AppResult<(Vec<String>, Vec<String>)> {
     let uarts = inventory_paths(&devices, 0x0403, 0x6010);
     let powers = inventory_paths(&devices, 0x10c4, 0xea60);
 
-    write_inventory(crate::config::GEN5_UART_TTY, &uarts)?;
-    write_inventory(crate::config::GEN5_POWER_TTY, &powers)?;
+    let paths = crate::control::paths();
+    write_inventory(&paths.gen5_uart_inventory, &uarts)?;
+    write_inventory(&paths.gen5_power_inventory, &powers)?;
 
     Ok((uarts, powers))
 }

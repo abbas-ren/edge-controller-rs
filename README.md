@@ -25,6 +25,11 @@ Useful environment variables:
 - `DEV_CONTROLLER_TOKEN`: optional 32-256 character bearer token. Configure it
 	whenever the API is reachable outside a trusted network.
 
+API authentication is disabled by default. FarmController's admin Control Center
+can enable it live with a 32-256 character visible-ASCII token, rotate that token,
+or disable it without restarting EdgeController. The token is write-only and is
+never returned by either controller API.
+
 Run `edgecontroller --help` for CLI options. Generation and RTOS functionality
 must be enabled explicitly with `--enable-gen3`, `--enable-gen4`,
 `--enable-gen5`, and `--enable-rtos`. `--check` validates configuration and
@@ -71,6 +76,16 @@ Operational endpoints:
 - `PUT /logs/level`
 - `GET /swagger.json`, `GET /docs`
 - `POST /confirmation`
+- `GET`, `PATCH`, `POST /admin/control`
+
+`/admin/control` exposes active and staged network, feature, logging, hardware,
+mapping-path, and authentication settings. Log level and API authentication apply
+live. Listener, feature, file, and hardware-selector changes are persisted to
+`/var/lib/dev-controller/admin-control.json` and require restart. Mapping paths
+must remain absolute, normalized, and below `/var/log`, `/var/lib/dev-controller`,
+or `/etc/log`. POST actions are limited to restart, mapping reload/clear, and
+controller UID clear; arbitrary commands and arbitrary filesystem access are not
+accepted.
 
 Hardware endpoints:
 

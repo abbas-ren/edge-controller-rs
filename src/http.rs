@@ -1,3 +1,4 @@
+mod control;
 mod gen4;
 mod gen5;
 mod relay;
@@ -30,7 +31,6 @@ use tracing::{debug, error, info, warn};
 
 use crate::store::{Gen5Mappings, UartMapping, UartMappings, UsbMappings};
 use crate::{
-    config::*,
     ipl,
     models::*,
     observability::metrics::global_metrics,
@@ -56,7 +56,7 @@ static MAPPING_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn persist_uart_mappings(mappings: &UartMappings) -> crate::error::AppResult<()> {
     let contents = crate::store::encode_uart(mappings)?;
-    crate::store::atomic_replace(Path::new(UART_MAPPING_FILE), contents.as_bytes())
+    crate::store::atomic_replace(&crate::control::paths().uart, contents.as_bytes())
 }
 
 fn parse_vid_pid(value: &str) -> crate::error::AppResult<(u16, u16)> {
@@ -463,7 +463,8 @@ async fn guarded_request(state: Arc<AppState>, mut request: Request<Body>, next:
 
     debug!(path = %request.uri(), "HTTP request entering request guard");
 
-    if let Some(expected) = state.api_token.as_deref() {
+    let expected_token = state.api_token.read().await.clone();
+    if let Some(expected) = expected_token.as_deref() {
         let supplied = request
             .headers()
             .get(header::AUTHORIZATION)
@@ -632,10 +633,11 @@ fn persist_usb_mappings(state: &AppState, mappings: &UsbMappings) -> crate::erro
     crate::store::validate_snapshot(mappings, &other)?;
 
     let contents = crate::store::encode_usb(mappings)?;
-    crate::store::atomic_replace(Path::new(USB_MAPPING_FILE), contents.as_bytes())?;
+    let path = crate::control::paths().usb;
+    crate::store::atomic_replace(&path, contents.as_bytes())?;
     global_metrics().set_mapping_counts(mappings.len(), other.len());
 
-    tracing::info!(usb_count = mappings.len(), path = %USB_MAPPING_FILE, "USB mapping state persisted");
+    tracing::info!(usb_count = mappings.len(), path = %path.display(), "USB mapping state persisted");
     Ok(())
 }
 
@@ -651,10 +653,11 @@ fn persist_gen5_mappings(state: &AppState, mappings: &Gen5Mappings) -> crate::er
     crate::store::validate_snapshot(&other, mappings)?;
 
     let contents = crate::store::encode_gen5(mappings)?;
-    crate::store::atomic_replace(Path::new(GEN5_MAPPING_FILE), contents.as_bytes())?;
+    let path = crate::control::paths().gen5;
+    crate::store::atomic_replace(&path, contents.as_bytes())?;
     global_metrics().set_mapping_counts(other.len(), mappings.len());
 
-    tracing::info!(gen5_count = mappings.len(), path = %GEN5_MAPPING_FILE, "Gen5 mapping state persisted");
+    tracing::info!(gen5_count = mappings.len(), path = %path.display(), "Gen5 mapping state persisted");
     Ok(())
 }
 
@@ -1218,6 +1221,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/metrics", get(metrics_handler))
         .route("/logs", get(runtime_logs_handler))
         .route("/logs/level", put(runtime_log_level_handler))
+        .route(
+            "/admin/control",
+            get(control::get)
+                .patch(control::patch)
+                .post(control::action),
+        )
         .route(
             "/swagger.json",
             get(crate::observability::swagger::swagger_json),
@@ -2858,7 +2867,7 @@ mod tests {
             deletion_requested: AtomicBool::new(false),
             client: reqwest::Client::new(),
             jobs: Jobs::default(),
-            api_token: None,
+            api_token: RwLock::new(None),
             features,
             registration_done: AtomicBool::new(false),
         })
@@ -2878,8 +2887,8 @@ mod tests {
     ) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let mut state = test_state(features, generation);
-        Arc::get_mut(&mut state).unwrap().api_token = api_token.map(str::to_owned);
+        let state = test_state(features, generation);
+        *state.api_token.write().await = api_token.map(str::to_owned);
         let app = router(state);
         let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (format!("http://{address}"), handle)
@@ -3036,6 +3045,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(accepted.status(), reqwest::StatusCode::OK);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn admin_control_requires_authentication_and_never_returns_the_token() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let (base, server) =
+            test_server_with_token(FeatureFlags::default(), Generation::Gen4, Some(token)).await;
+        let client = reqwest::Client::new();
+
+        let missing = client
+            .get(format!("{base}/admin/control"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        let response = client
+            .get(format!("{base}/admin/control"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body = response.text().await.unwrap();
+        assert!(!body.contains(token));
+        let snapshot = serde_json::from_str::<serde_json::Value>(&body).unwrap();
+        assert_eq!(snapshot["authentication"]["enabled"], true);
+        assert_eq!(snapshot["authentication"]["tokenConfigured"], true);
+        assert!(snapshot["authentication"].get("apiToken").is_none());
+
         server.abort();
     }
 

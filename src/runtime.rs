@@ -144,20 +144,21 @@ pub fn check_offline(
     config_path: &str,
     bind_address: SocketAddr,
     authentication_enabled: bool,
+    mapping_paths: &crate::control::MappingPaths,
 ) -> Result<()> {
-    use std::path::Path;
-
     cfg.validate().context("validating service configuration")?;
 
     for filename in [
-        config::UID_FILE,
-        config::USB_MAPPING_FILE,
-        config::GEN5_MAPPING_FILE,
-        config::UART_MAPPING_FILE,
+        &mapping_paths.uid,
+        &mapping_paths.usb,
+        &mapping_paths.gen5,
+        &mapping_paths.uart,
+        &mapping_paths.gen5_uart_inventory,
+        &mapping_paths.gen5_power_inventory,
     ] {
-        let parent = Path::new(filename)
+        let parent = filename
             .parent()
-            .ok_or_else(|| anyhow!("state pathname has no parent: {filename}"))?;
+            .ok_or_else(|| anyhow!("state pathname has no parent: {}", filename.display()))?;
 
         let metadata = std::fs::symlink_metadata(parent)
             .with_context(|| format!("inspecting state directory {}", parent.display()))?;
@@ -170,16 +171,12 @@ pub fn check_offline(
         }
     }
 
-    let (usb, gen5) = store::load_mappings(
-        Path::new(config::USB_MAPPING_FILE),
-        Path::new(config::GEN5_MAPPING_FILE),
-    )
-    .context("validating persisted mappings")?;
-    let uart = store::load_uart_mappings(Path::new(config::UART_MAPPING_FILE))
+    let (usb, gen5) = store::load_mappings(&mapping_paths.usb, &mapping_paths.gen5)
+        .context("validating persisted mappings")?;
+    let uart = store::load_uart_mappings(&mapping_paths.uart)
         .context("validating persisted UART mappings")?;
 
-    let uid = store::load_uid(Path::new(config::UID_FILE))
-        .context("validating persisted controller ID")?;
+    let uid = store::load_uid(&mapping_paths.uid).context("validating persisted controller ID")?;
 
     let report = serde_json::json!({
         "status": "valid",
@@ -188,6 +185,7 @@ pub fn check_offline(
         "interface": cfg.iface_name,
         "listen_address": bind_address.to_string(),
         "authentication_enabled": authentication_enabled,
+        "mapping_paths": mapping_paths,
         "usb_mapping_count": usb.len(),
         "gen5_mapping_count": gen5.len(),
         "uart_mapping_count": uart.len(),
@@ -204,10 +202,11 @@ pub fn check_offline(
 
 #[cfg(test)]
 mod tests {
-    use super::{interface_identity, registration_loop_with_delay};
+    use super::{check_offline, interface_identity, registration_loop_with_delay};
     use crate::{
         cli::FeatureFlags,
         config::AppConfig,
+        control::MappingPaths,
         jobs::Jobs,
         models::Generation,
         relay::RelayController,
@@ -223,6 +222,30 @@ mod tests {
         time::Duration,
     };
     use tokio::sync::{Mutex, RwLock};
+
+    #[test]
+    fn offline_check_uses_selected_mapping_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let mapping_paths = MappingPaths {
+            uid: directory.path().join("controller.uid"),
+            usb: directory.path().join("usb.csv"),
+            gen5: directory.path().join("gen5.csv"),
+            uart: directory.path().join("uart.csv"),
+            gen5_uart_inventory: directory.path().join("gen5-uart.txt"),
+            gen5_power_inventory: directory.path().join("gen5-power.txt"),
+        };
+        let config =
+            AppConfig::parse("server_ip=127.0.0.1\nhttp_port=5000\nws_port=5002\ngen=4\n").unwrap();
+
+        check_offline(
+            &config,
+            "/etc/config/login.cfg",
+            "127.0.0.1:8888".parse().unwrap(),
+            false,
+            &mapping_paths,
+        )
+        .unwrap();
+    }
 
     #[test]
     fn invalid_interface_names_are_rejected() {
@@ -277,7 +300,7 @@ mod tests {
             deletion_requested: AtomicBool::new(false),
             client: reqwest::Client::new(),
             jobs: Jobs::default(),
-            api_token: None,
+            api_token: RwLock::new(None),
             features: FeatureFlags::default(),
             registration_done: AtomicBool::new(false),
         });

@@ -10,6 +10,7 @@
 mod cli;
 mod config;
 mod constants;
+mod control;
 mod error;
 mod gpio;
 mod http;
@@ -30,7 +31,7 @@ pub use cli::{Cli, FeatureFlags};
 
 use anyhow::{anyhow, Context, Result};
 use state::AppState;
-use std::{net::SocketAddr, sync::atomic::Ordering, time::Duration};
+use std::{net::SocketAddr, path::Path, sync::atomic::Ordering, time::Duration};
 use tracing::{info, warn};
 
 #[tokio::main]
@@ -49,17 +50,17 @@ async fn main() -> Result<()> {
     let cli = Cli::parse(std::env::args_os().skip(1))?;
 
     let (
-        config_path,
+        mut config_path,
         check_only,
-        log_level,
-        log_file,
-        log_network,
-        log_stream,
-        metrics_port,
-        bind_port,
-        features,
-        relay_serial_number,
-        vid_pid,
+        mut log_level,
+        mut log_file,
+        mut log_network,
+        mut log_stream,
+        mut metrics_port,
+        mut bind_port,
+        mut features,
+        mut relay_serial_number,
+        mut vid_pid,
     ) = match cli {
         Cli::Help => {
             print!("{}", Cli::help_text()?);
@@ -92,6 +93,25 @@ async fn main() -> Result<()> {
         ),
     };
 
+    let persisted_control = control::load(Path::new(control::CONTROL_FILE))?;
+    if let Some(settings) = &persisted_control {
+        config_path.clone_from(&settings.config_path);
+        log_level = Some(settings.log_level.clone());
+        log_file.clone_from(&settings.log_file);
+        log_network = settings.log_network;
+        log_stream = settings.log_stream;
+        metrics_port = settings.metrics_port;
+        bind_port = settings.bind_port;
+        features = FeatureFlags {
+            gen3: settings.enable_gen3,
+            gen4: settings.enable_gen4,
+            gen5: settings.enable_gen5,
+            rtos: settings.enable_rtos,
+        };
+        relay_serial_number.clone_from(&settings.relay_serial_number);
+        vid_pid.clone_from(&settings.relay_vid_pid);
+    }
+
     logging::init_logging(
         log_level.as_deref(),
         log_file.as_deref(),
@@ -112,6 +132,19 @@ async fn main() -> Result<()> {
 
     let mut cfg = config::AppConfig::load_legacy_cfg(&config_path)
         .with_context(|| format!("loading configuration from {config_path}"))?;
+
+    if let Some(settings) = &persisted_control {
+        cfg.server_ip.clone_from(&settings.server_ip);
+        cfg.http_port = settings.http_port;
+        cfg.ws_port = settings.ws_port;
+        cfg.gen = match settings.generation {
+            3 => models::Generation::Gen3,
+            4 => models::Generation::Gen4,
+            5 => models::Generation::Gen5,
+            _ => unreachable!("validated control generation"),
+        };
+        cfg.iface_name.clone_from(&settings.interface);
+    }
 
     match std::env::var("DEV_CONTROLLER_INTERFACE") {
         Ok(interface) => {
@@ -135,16 +168,20 @@ async fn main() -> Result<()> {
 
     // Preserve the legacy all-interface listener. Deployments should configure
     // a bearer token or restrict access at the network boundary.
-    let bind_value = match std::env::var("DEV_CONTROLLER_BIND") {
-        Ok(value) => {
-            info!(bind = %value, "DEV_CONTROLLER_BIND override applied");
-            value
-        }
-        Err(std::env::VarError::NotPresent) => {
-            format!("0.0.0.0:{}", cfg.bind_port)
-        }
-        Err(std::env::VarError::NotUnicode(_)) => {
-            return Err(anyhow!("DEV_CONTROLLER_BIND must be valid UTF-8"));
+    let bind_value = if let Some(settings) = &persisted_control {
+        format!("{}:{}", settings.bind_address, settings.bind_port)
+    } else {
+        match std::env::var("DEV_CONTROLLER_BIND") {
+            Ok(value) => {
+                info!(bind = %value, "DEV_CONTROLLER_BIND override applied");
+                value
+            }
+            Err(std::env::VarError::NotPresent) => {
+                format!("0.0.0.0:{}", cfg.bind_port)
+            }
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(anyhow!("DEV_CONTROLLER_BIND must be valid UTF-8"));
+            }
         }
     };
 
@@ -158,7 +195,11 @@ async fn main() -> Result<()> {
         ));
     }
 
-    let api_token = config::configured_api_token()?;
+    let api_token = match &persisted_control {
+        Some(settings) if settings.auth_enabled => settings.api_token.clone(),
+        Some(_) => None,
+        None => config::configured_api_token()?,
+    };
     if !bind_address.ip().is_loopback() && api_token.is_none() {
         warn!(
             %bind_address,
@@ -168,8 +209,44 @@ async fn main() -> Result<()> {
     // This branch must precede signal installation, interface discovery,
     // AppState construction, USB inventory, and server startup.
     if check_only {
-        return runtime::check_offline(&cfg, &config_path, bind_address, api_token.is_some());
+        let mapping_paths = persisted_control
+            .as_ref()
+            .map(|settings| settings.paths.clone())
+            .unwrap_or_default();
+        return runtime::check_offline(
+            &cfg,
+            &config_path,
+            bind_address,
+            api_token.is_some(),
+            &mapping_paths,
+        );
     }
+
+    let effective_control = persisted_control.unwrap_or_else(|| control::ControlSettings {
+        config_path: config_path.clone(),
+        bind_address: bind_address.ip().to_string(),
+        bind_port: bind_address.port(),
+        metrics_port,
+        interface: cfg.iface_name.clone(),
+        server_ip: cfg.server_ip.clone(),
+        http_port: cfg.http_port,
+        ws_port: cfg.ws_port,
+        generation: cfg.gen.as_int(),
+        enable_gen3: features.gen3,
+        enable_gen4: features.gen4,
+        enable_gen5: features.gen5,
+        enable_rtos: features.rtos,
+        relay_serial_number: relay_serial_number.clone(),
+        relay_vid_pid: vid_pid.clone(),
+        log_level: log_level.clone().unwrap_or_else(|| "info".to_owned()),
+        log_file: log_file.clone(),
+        log_network,
+        log_stream,
+        auth_enabled: api_token.is_some(),
+        api_token: api_token.clone(),
+        ..control::ControlSettings::default()
+    });
+    control::install(effective_control)?;
 
     // Network discovery is synchronous and runs before request handling.
     let interface = cfg.iface_name.clone();
@@ -198,7 +275,7 @@ async fn main() -> Result<()> {
         vid_pid: Some(vid_pid),
     });
 
-    let state = AppState::new(cfg, mac, ip, features, relay_selector)
+    let state = AppState::new(cfg, mac, ip, features, relay_selector, api_token)
         .await
         .context("initializing controller state")?;
 

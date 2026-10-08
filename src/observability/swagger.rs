@@ -54,7 +54,7 @@ fn post_operation(
 
 /// Return the complete OpenAPI contract exposed by the HTTP router.
 pub fn openapi_document() -> serde_json::Value {
-    json!({
+    let mut document = json!({
         "openapi": "3.0.3",
         "info": {
             "title": "edgecontroller",
@@ -223,7 +223,67 @@ pub fn openapi_document() -> serde_json::Value {
                 "RtosEndRequest": {"type": "object", "required": ["gen"], "properties": {"gen": {"type": "integer", "enum": [4, 5]}, "mac": {"type": "string", "nullable": true}, "serial": {"type": "string", "nullable": true}, "channel": {"type": "integer", "minimum": 0, "maximum": 7, "nullable": true}, "rtos": {"type": "string", "nullable": true}}}
             }
         }
-    })
+    });
+
+    let paths = document["paths"]
+        .as_object_mut()
+        .expect("OpenAPI paths are an object");
+    paths.insert(
+        "/logs".into(),
+        json!({"get": {
+            "summary": "Read the bounded runtime log buffer",
+            "responses": responses("200", "Runtime log entries and current capture level")
+        }}),
+    );
+    paths.insert(
+        "/logs/level".into(),
+        json!({"put": {
+            "summary": "Change the runtime tracing level",
+            "requestBody": json_request("RuntimeLogLevelRequest"),
+            "responses": responses("200", "Runtime tracing level updated")
+        }}),
+    );
+    paths.insert(
+        "/admin/control".into(),
+        json!({
+            "get": {
+                "summary": "Read active and staged controller settings",
+                "responses": responses("200", "Controller control-plane snapshot")
+            },
+            "patch": {
+                "summary": "Update validated controller settings",
+                "requestBody": json_request("ControlPatch"),
+                "responses": responses("200", "Controller settings updated")
+            },
+            "post": {
+                "summary": "Run an allowlisted controller action",
+                "requestBody": json_request("ControlActionRequest"),
+                "responses": responses("200", "Controller action completed")
+            }
+        }),
+    );
+
+    let schemas = document["components"]["schemas"]
+        .as_object_mut()
+        .expect("OpenAPI schemas are an object");
+    schemas.insert(
+        "RuntimeLogLevelRequest".into(),
+        json!({"type": "object", "required": ["level"], "properties": {
+            "level": {"type": "string", "enum": ["trace", "debug", "info", "warn", "error", "off"]}
+        }}),
+    );
+    schemas.insert(
+        "ControlPatch".into(),
+        json!({"type": "object", "description": "Partial validated EdgeController control settings"}),
+    );
+    schemas.insert(
+        "ControlActionRequest".into(),
+        json!({"type": "object", "required": ["action"], "properties": {
+            "action": {"type": "string", "enum": ["restart", "reloadMappings", "clearUsbMappings", "clearGen5Mappings", "clearUartMappings", "clearControllerUid"]}
+        }}),
+    );
+
+    document
 }
 
 pub async fn swagger_json() -> Response {
@@ -287,6 +347,9 @@ mod tests {
             })
             .collect::<BTreeSet<_>>();
         let routed = BTreeSet::from([
+            ("/admin/control", "get"),
+            ("/admin/control", "patch"),
+            ("/admin/control", "post"),
             ("/confirmation", "post"),
             ("/devCon/delete", "post"),
             ("/docs", "get"),
@@ -299,6 +362,8 @@ mod tests {
             ("/ipl/remove", "post"),
             ("/mapping/entry", "post"),
             ("/metrics", "get"),
+            ("/logs", "get"),
+            ("/logs/level", "put"),
             ("/ready", "get"),
             ("/reboot-device", "post"),
             ("/relay", "post"),

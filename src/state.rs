@@ -11,7 +11,6 @@ use crate::{
 
 use std::{
     collections::HashMap,
-    path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -47,7 +46,7 @@ pub struct AppState {
     pub(crate) deletion_requested: AtomicBool,
     pub client: reqwest::Client,
     pub jobs: Jobs,
-    pub api_token: Option<String>,
+    pub api_token: RwLock<Option<String>>,
     pub features: FeatureFlags,
     pub registration_done: AtomicBool,
 }
@@ -59,6 +58,7 @@ impl AppState {
         board_ip: String,
         features: FeatureFlags,
         relay_selector: Option<RelaySelector>,
+        api_token: Option<String>,
     ) -> AppResult<Arc<Self>> {
         cfg.validate()?;
         store::checked_mac(&board_mac)?;
@@ -67,7 +67,6 @@ impl AppState {
             .parse::<std::net::Ipv4Addr>()
             .map_err(|_| AppError::Msg("controller interface IP is not IPv4".into()))?;
 
-        let api_token = configured_api_token()?;
         if api_token.as_ref().is_some_and(|token| {
             !(32..=256).contains(&token.len()) || !token.bytes().all(|byte| byte.is_ascii_graphic())
         }) {
@@ -80,13 +79,13 @@ impl AppState {
             ));
         }
 
+        let paths = crate::control::paths();
         let (usb_map, gen5_map, uart_map, uid) = tokio::task::spawn_blocking(move || {
             tracing::info!("loading persisted controller state");
-            let (usb_map, gen5_map) =
-                store::load_mappings(Path::new(USB_MAPPING_FILE), Path::new(GEN5_MAPPING_FILE))?;
-            let uart_map = store::load_uart_mappings(Path::new(UART_MAPPING_FILE))?;
+            let (usb_map, gen5_map) = store::load_mappings(&paths.usb, &paths.gen5)?;
+            let uart_map = store::load_uart_mappings(&paths.uart)?;
 
-            let uid = store::load_uid(Path::new(UID_FILE))?;
+            let uid = store::load_uid(&paths.uid)?;
 
             tracing::debug!(
                 usb_map_count = usb_map.len(),
@@ -97,8 +96,8 @@ impl AppState {
 
             if usb_map.is_empty() && gen5_map.is_empty() {
                 tracing::info!(
-                    usb_mapping_path = %USB_MAPPING_FILE,
-                    gen5_mapping_path = %GEN5_MAPPING_FILE,
+                    usb_mapping_path = %paths.usb.display(),
+                    gen5_mapping_path = %paths.gen5.display(),
                     "mapping files are empty or absent; starting from an empty persisted state"
                 );
             }
@@ -132,7 +131,7 @@ impl AppState {
             deletion_requested: AtomicBool::new(false),
             client,
             jobs: Jobs::default(),
-            api_token,
+            api_token: RwLock::new(api_token),
             features,
             registration_done: AtomicBool::new(false),
         });
@@ -158,10 +157,11 @@ impl AppState {
         store::validate_uid(uid)?;
         let mut controller = self.controller.write().await;
 
-        tracing::info!(uid = %uid, path = %UID_FILE, "persisting controller UID to state store");
+        let path = crate::control::paths().uid;
+        tracing::info!(uid = %uid, path = %path.display(), "persisting controller UID to state store");
 
         // No .await between commit and publication.
-        store::atomic_replace(Path::new(UID_FILE), uid.as_bytes())?;
+        store::atomic_replace(&path, uid.as_bytes())?;
         controller.uid = Some(uid.to_owned());
 
         tracing::debug!(uid = %uid, "controller UID written and published in memory");
@@ -170,12 +170,13 @@ impl AppState {
 
     pub async fn clear_uid(&self) -> AppResult<()> {
         let mut controller = self.controller.write().await;
+        let path = crate::control::paths().uid;
 
-        tracing::warn!(path = %UID_FILE, "clearing persisted controller UID");
-        store::remove_committed(Path::new(UID_FILE))?;
+        tracing::warn!(path = %path.display(), "clearing persisted controller UID");
+        store::remove_committed(&path)?;
         controller.uid = None;
 
-        tracing::info!(path = %UID_FILE, "controller UID removed from persisted state and memory");
+        tracing::info!(path = %path.display(), "controller UID removed from persisted state and memory");
         Ok(())
     }
 
@@ -268,7 +269,7 @@ mod tests {
             deletion_requested: AtomicBool::new(false),
             client: reqwest::Client::new(),
             jobs: Jobs::default(),
-            api_token: None,
+            api_token: RwLock::new(None),
             features: FeatureFlags::default(),
             registration_done: AtomicBool::new(false),
         };
