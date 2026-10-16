@@ -227,17 +227,9 @@ fn set_boot_mode(state: &AppState, target: &FlashWriterTarget, download: bool) -
 fn download_console(
     state: &AppState,
     target: &FlashWriterTarget,
-    package: Option<&Path>,
+    prefix: Option<&str>,
 ) -> AppResult<Console> {
-    let mut console = Console::open(
-        &target.tty,
-        921_600,
-        Some(&format!(
-            "{}{}",
-            target.mac,
-            package.map_or("".into(), |p| p.display().to_string())
-        )),
-    )?;
+    let mut console = Console::open(&target.tty, 921_600, prefix)?;
     console.clear_input()?;
 
     set_boot_mode(state, target, true)?;
@@ -358,7 +350,11 @@ fn flashwriter_sync(state: &AppState, target: &FlashWriterTarget, package: &Path
     )?;
 
     let operation = (|| {
-        let mut console = download_console(state, target, Some(package))?;
+        let mut console = download_console(
+            state,
+            target,
+            Some(&format!("gen-{}-{}", target.generation, target.mac)),
+        )?;
 
         console.send_srec(&image_file(package, FLASHWRITER)?)?;
         console.wait(b">", seconds(30))?;
