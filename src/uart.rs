@@ -1,7 +1,8 @@
 //! Linux serial helpers and a bounded, buffered request/response channel.
 
-use crate::error::{AppError, AppResult};
+use crate::{constants::LOG_ROOT, error::{AppError, AppResult}};
 use serialport::SerialPort;
+use tracing::{error, info};
 
 use std::{
     fs::{File, OpenOptions},
@@ -41,14 +42,27 @@ pub fn write_to_path(path: &str, text: &str) -> AppResult<()> {
 pub struct Console {
     port: Box<dyn SerialPort>,
     pending: Vec<u8>,
+    uart_log: Option<File>,
 }
 
 impl Console {
-    pub fn open(path: &str, baud: u32) -> AppResult<Self> {
+    pub fn open(path: &str, baud: u32, uart_log_prefix: Option<&str>) -> AppResult<Self> {
         Ok(Self {
             port: open_uart(path, baud)?,
             pending: Vec::with_capacity(4096),
+            uart_log: uart_log_prefix.map(|prefix| {
+                let log_path = Path::new(LOG_ROOT).join(format!("{prefix}.uart.log"));
+                OpenOptions::new().append(true).create(true).open(&log_path).unwrap()
+            }),
         })
+    }
+
+    pub fn write_uart_log(&mut self, bytes: &[u8]) -> AppResult<()> {
+        if let Some(log) = &mut self.uart_log {
+            log.write_all(bytes)?;
+            log.flush()?;
+        }
+        Ok(())
     }
 
     pub fn clear_input(&mut self) -> AppResult<()> {
@@ -61,12 +75,21 @@ impl Console {
     }
 
     pub fn send(&mut self, bytes: &[u8]) -> AppResult<()> {
-        self.port.write_all(bytes)?;
-        self.port.flush()?;
+        if let Err(err) = self.port.write_all(bytes) {
+            error!("UART write failed: {err}");
+            self.write_uart_log(format!("UART write failed: {err}").as_bytes())?;
+            return Err(AppError::Msg(format!("UART write failed: {err}")));
+        }
+        if let Err(err) = self.port.flush() {
+            error!("UART flush failed: {err}");
+            self.write_uart_log(format!("UART flush failed: {err}").as_bytes())?;
+            return Err(AppError::Msg(format!("UART flush failed: {err}")));
+        }
         Ok(())
     }
 
     pub fn command(&mut self, command: &str) -> AppResult<()> {
+        self.write_uart_log(format!("UART command: {command}").as_bytes())?;
         self.send(command.as_bytes())?;
 
         // Preserve command pacing expected by the legacy FlashWriter.
@@ -91,6 +114,7 @@ impl Console {
             return Err(AppError::Msg("invalid UART prompt specification".into()));
         }
 
+        self.write_uart_log(format!("UART wait_any called with patterns: {:?}", patterns).as_bytes())?;
         let deadline = Instant::now() + timeout;
         let keep = patterns
             .iter()
@@ -119,6 +143,7 @@ impl Console {
             }
 
             if Instant::now() >= deadline {
+                self.write_uart_log(format!("UART wait_any timeout. expected one of the patterns: {:?}", patterns).as_bytes())?;
                 return Err(AppError::Msg(format!(
                     "UART prompt timeout; expected one of {:?}",
                     patterns
@@ -138,6 +163,7 @@ impl Console {
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 Ok(count) => {
+                    self.write_uart_log(&input[..count])?;
                     self.pending.extend_from_slice(&input[..count]);
                 }
                 Err(error)
@@ -146,7 +172,9 @@ impl Console {
                         std::io::ErrorKind::TimedOut
                             | std::io::ErrorKind::WouldBlock
                             | std::io::ErrorKind::Interrupted
-                    ) => {}
+                    ) => {
+                        self.write_uart_log(format!("UART read error: {error}").as_bytes())?;
+                    }
                 Err(error) => return Err(error.into()),
             }
         }
@@ -173,10 +201,14 @@ impl Console {
             };
 
             if count == 0 {
+                info!("Reached end of S-record file: {}", path.display());
+                self.write_uart_log(format!("Reached end of S-record file: {}\n", path.display()).as_bytes())?;
                 break;
             }
 
             if line.len() > 1024 {
+                error!("S-record line exceeds 1024 bytes in {}", path.display());
+                self.write_uart_log(format!("S-record line exceeds 1024 bytes in {}\n", path.display()).as_bytes())?;   
                 return Err(AppError::Msg(format!(
                     "S-record line exceeds 1024 bytes in {}",
                     path.display()
@@ -188,6 +220,8 @@ impl Console {
             }
 
             if !line.starts_with(b"S") {
+                error!("invalid S-record line in {}", path.display());
+                self.write_uart_log(format!("invalid S-record line in {}\n", path.display()).as_bytes())?;
                 return Err(AppError::Msg(format!(
                     "invalid S-record line in {}",
                     path.display()

@@ -4,6 +4,7 @@
 //! exclusive hardware-operation lease until these functions finish.
 
 use crate::{
+    constants::{FIRMWARE_ROOT, FLASHWRITER, MAX_IMAGE_BYTES, LOG_ROOT},
     error::{AppError, AppResult},
     gpio::GpioController,
     models::VoltageLevel,
@@ -23,12 +24,7 @@ use std::{
 
 use tracing::{error, info};
 
-pub const FIRMWARE_ROOT: &str = "/var/lib/dev-controller/firmware";
-const LOG_ROOT: &str = "/var/lib/dev-controller/ipl";
 
-const FLASHWRITER: &str = "ICUMX_Flash_writer_SCIF_DUMMY_CERT_EB203000_V4H.mot";
-
-const MAX_IMAGE_BYTES: u64 = 128 * 1024 * 1024;
 
 pub fn supports_relay_flash(generation: u8) -> bool {
     matches!(generation, 3 | 4)
@@ -230,8 +226,8 @@ fn set_boot_mode(state: &AppState, target: &FlashWriterTarget, download: bool) -
 }
 
 /// Enter SCIF download mode, opening UART before the boot begins.
-fn download_console(state: &AppState, target: &FlashWriterTarget) -> AppResult<Console> {
-    let mut console = Console::open(&target.tty, 921_600)?;
+fn download_console(state: &AppState, target: &FlashWriterTarget, package: Option<&Path>) -> AppResult<Console> {
+    let mut console = Console::open(&target.tty, 921_600, Some(&format!("{}{}", target.mac, package.map_or("".into(), |p| p.display().to_string()))))?;
     console.clear_input()?;
 
     set_boot_mode(state, target, true)?;
@@ -261,7 +257,7 @@ pub fn mode_sync(state: &AppState, target: &FlashWriterTarget, download: bool) -
         return set_boot_mode(state, target, false);
     }
 
-    match download_console(state, target) {
+    match download_console(state, target, None) {
         Ok(console) => {
             drop(console);
             Ok(())
@@ -352,21 +348,27 @@ fn flashwriter_sync(state: &AppState, target: &FlashWriterTarget, package: &Path
     )?;
 
     let operation = (|| {
-        let mut console = download_console(state, target)?;
+        let mut console = download_console(state, target, Some(package))?;
 
         console.send_srec(&image_file(package, FLASHWRITER)?)?;
         console.wait(b">", seconds(30))?;
+
+        let total = IMAGES.len();
+        let mut completed = 0;
 
         for image in &IMAGES {
             writeln!(log, "Programming {}", image.name)?;
             log.flush()?;
 
             transfer_image(&mut console, package, image)?;
+            completed += 1;
+            notify_sync(state, true, Some((completed * 100 / total) as u8), &format!("Flashing {} completed", image.name), &target.mac, target.generation)?;
             std::thread::sleep(seconds(1));
         }
 
         // Drop UART ownership before restarting the board.
         drop(console);
+
         Ok(())
     })();
 
@@ -389,17 +391,26 @@ fn completion_endpoint(generation: u8) -> &'static str {
     }
 }
 
-async fn notify(state: &AppState, generation: u8, success: bool) {
-    let endpoint = completion_endpoint(generation);
+async fn notify(state: &AppState, success: bool, progress: Option<u8>, message: &str, mac: &str, gen: u8) {
+    let endpoint = completion_endpoint(gen);
 
     let status = if success { "success" } else { "failure" };
 
     let url = format!(
-        "http://{}:{}/api/v1/device/{endpoint}?status={status}",
+        "http://{}:{}/api/v1/device/{endpoint}",
         state.cfg.server_ip, state.cfg.http_port,
     );
 
-    let result = match state.client.get(url).send().await {
+    let flashing_status = serde_json::json!({
+        "status": status,
+        "percentage": progress,
+        "completed": success,
+        "mac": mac,
+        "generation": gen,
+        "message": message,
+    });
+
+    let result = match state.client.post(url).body(flashing_status.to_string()).send().await {
         Ok(response) => response.error_for_status(),
         Err(error) => Err(error),
     };
@@ -407,11 +418,19 @@ async fn notify(state: &AppState, generation: u8, success: bool) {
     if let Err(error) = result {
         error!(
             %error,
-            generation,
+            generation = gen,
             success,
             "IPL completion notification failed"
         );
     }
+}
+
+fn notify_sync(state: &AppState, success: bool, progress: Option<u8>, message: &str, mac: &str, gen: u8) -> AppResult<()> {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(
+        notify(state, success, progress, message, mac, gen)
+    );
+    Ok(())
 }
 
 pub async fn run_flashwriter(
@@ -422,6 +441,8 @@ pub async fn run_flashwriter(
     let generation = target.generation;
     let started = std::time::Instant::now();
     let worker_state = state.clone();
+    let mac = target.mac.clone();
+    let gen = target.generation;
 
     let result = match tokio::task::spawn_blocking(move || {
         flashwriter_sync(&worker_state, &target, &package)
@@ -439,7 +460,8 @@ pub async fn run_flashwriter(
         result.is_ok(),
         started.elapsed().as_secs_f64(),
     );
-    notify(&state, generation, result.is_ok()).await;
+
+    notify(&state, result.is_ok(), Some(100), &format!("{}", result.as_ref().err().unwrap_or(&AppError::Msg("IPL completed successfully".into()))), &mac, gen).await;
     result
 }
 
@@ -479,6 +501,7 @@ fn contains_success_marker(path: &Path) -> AppResult<bool> {
 /// stdout/stderr stream to disk rather than accumulating in memory.
 pub async fn run_gen5(state: Arc<AppState>, job: Gen5Job) -> AppResult<()> {
     let started = std::time::Instant::now();
+    let mac = job.mac.clone();
     let result: AppResult<()> = async {
         let hil = fs::canonicalize(job.package.join("HIL"))?;
 
@@ -524,7 +547,7 @@ pub async fn run_gen5(state: Arc<AppState>, job: Gen5Job) -> AppResult<()> {
     .await;
 
     global_metrics().record_firmware_flash(5, result.is_ok(), started.elapsed().as_secs_f64());
-    notify(&state, 5, result.is_ok()).await;
+    notify(&state, result.is_ok(), Some(100), &format!("{}", result.as_ref().err().unwrap_or(&AppError::Msg("IPL completed successfully".into()))), &mac, 5).await;
     result
 }
 

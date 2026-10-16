@@ -21,7 +21,7 @@ pub const GEN5_POWER_TTY: &str = "/var/log/gen5_power.csv";
 pub const GEN5_UART_TTY: &str = "/var/log/gen5_uart.csv";
 pub const USB_MAPPING_FILE: &str = "/var/log/usb_mapping.csv";
 pub const GEN5_MAPPING_FILE: &str = "/var/log/gen5_mapping.csv";
-pub const UART_MAPPING_FILE: &str = "/etc/log/uart_mappings.csv";
+pub const UART_MAPPING_FILE: &str = "/var/log/uart_mappings.csv";
 
 const MAX_CONFIG_BYTES: usize = 16 * 1024;
 
