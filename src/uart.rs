@@ -50,18 +50,27 @@ pub struct Console {
 
 impl Console {
     pub fn open(path: &str, baud: u32, uart_log_prefix: Option<&str>) -> AppResult<Self> {
-        Ok(Self {
-            port: open_uart(path, baud)?,
-            pending: Vec::with_capacity(4096),
-            uart_log: uart_log_prefix.map(|prefix| {
+        let port = open_uart(path, baud)?;
+
+        let uart_log = uart_log_prefix
+            .map(|prefix| {
                 let log_path = Path::new(LOG_ROOT).join(format!("{prefix}.uart.log"));
+
                 OpenOptions::new()
-                    .append(true)
+                    .write(true)
                     .create(true)
                     .truncate(true)
                     .open(&log_path)
-                    .unwrap()
-            }),
+                    .map_err(|error| {
+                        AppError::Msg(format!("opening UART log {log_path:?} failed: {error}"))
+                    })
+            })
+            .transpose()?;
+
+        Ok(Self {
+            port,
+            pending: Vec::with_capacity(4096),
+            uart_log,
         })
     }
 
