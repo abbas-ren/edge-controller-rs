@@ -4,7 +4,7 @@
 //! exclusive hardware-operation lease until these functions finish.
 
 use crate::{
-    constants::{FIRMWARE_ROOT, FLASHWRITER, MAX_IMAGE_BYTES, LOG_ROOT},
+    constants::{FIRMWARE_ROOT, FLASHWRITER, LOG_ROOT, MAX_IMAGE_BYTES},
     error::{AppError, AppResult},
     gpio::GpioController,
     models::VoltageLevel,
@@ -23,8 +23,6 @@ use std::{
 };
 
 use tracing::{error, info};
-
-
 
 pub fn supports_relay_flash(generation: u8) -> bool {
     matches!(generation, 3 | 4)
@@ -226,8 +224,20 @@ fn set_boot_mode(state: &AppState, target: &FlashWriterTarget, download: bool) -
 }
 
 /// Enter SCIF download mode, opening UART before the boot begins.
-fn download_console(state: &AppState, target: &FlashWriterTarget, package: Option<&Path>) -> AppResult<Console> {
-    let mut console = Console::open(&target.tty, 921_600, Some(&format!("{}{}", target.mac, package.map_or("".into(), |p| p.display().to_string()))))?;
+fn download_console(
+    state: &AppState,
+    target: &FlashWriterTarget,
+    package: Option<&Path>,
+) -> AppResult<Console> {
+    let mut console = Console::open(
+        &target.tty,
+        921_600,
+        Some(&format!(
+            "{}{}",
+            target.mac,
+            package.map_or("".into(), |p| p.display().to_string())
+        )),
+    )?;
     console.clear_input()?;
 
     set_boot_mode(state, target, true)?;
@@ -355,14 +365,50 @@ fn flashwriter_sync(state: &AppState, target: &FlashWriterTarget, package: &Path
 
         let total = IMAGES.len();
         let mut completed = 0;
+        info!(
+            "Starting IPL flashing for Gen{} device {}",
+            target.generation, target.mac
+        );
+        notify_sync(
+            state,
+            true,
+            Some(0),
+            "IPL flashing starting",
+            &target.mac,
+            target.generation,
+        )?;
 
         for image in &IMAGES {
             writeln!(log, "Programming {}", image.name)?;
             log.flush()?;
 
+            info!("Flashing image: {}", image.name);
+            notify_sync(
+                state,
+                true,
+                Some(0),
+                &format!("Flashing image: {}", image.name),
+                &target.mac,
+                target.generation,
+            )?;
+
             transfer_image(&mut console, package, image)?;
+
             completed += 1;
-            notify_sync(state, true, Some((completed * 100 / total) as u8), &format!("Flashing {} completed", image.name), &target.mac, target.generation)?;
+
+            info!(
+                "Flashing {} completed ({}/{})",
+                image.name, completed, total
+            );
+            notify_sync(
+                state,
+                true,
+                Some((completed * 100 / total) as u8),
+                &format!("Flashing {} completed", image.name),
+                &target.mac,
+                target.generation,
+            )?;
+
             std::thread::sleep(seconds(1));
         }
 
@@ -391,7 +437,14 @@ fn completion_endpoint(generation: u8) -> &'static str {
     }
 }
 
-async fn notify(state: &AppState, success: bool, progress: Option<u8>, message: &str, mac: &str, gen: u8) {
+async fn notify(
+    state: &AppState,
+    success: bool,
+    progress: Option<u8>,
+    message: &str,
+    mac: &str,
+    gen: u8,
+) {
     let endpoint = completion_endpoint(gen);
 
     let status = if success { "success" } else { "failure" };
@@ -410,7 +463,14 @@ async fn notify(state: &AppState, success: bool, progress: Option<u8>, message: 
         "message": message,
     });
 
-    let result = match state.client.post(url).body(flashing_status.to_string()).send().await {
+    let result = match state
+        .client
+        .post(url)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(flashing_status.to_string())
+        .send()
+        .await
+    {
         Ok(response) => response.error_for_status(),
         Err(error) => Err(error),
     };
@@ -423,13 +483,23 @@ async fn notify(state: &AppState, success: bool, progress: Option<u8>, message: 
             "IPL completion notification failed"
         );
     }
+    info!(
+        generation = gen,
+        flashing_status = flashing_status.to_string(),
+        "IPL completion notification sent"
+    );
 }
 
-fn notify_sync(state: &AppState, success: bool, progress: Option<u8>, message: &str, mac: &str, gen: u8) -> AppResult<()> {
+fn notify_sync(
+    state: &AppState,
+    success: bool,
+    progress: Option<u8>,
+    message: &str,
+    mac: &str,
+    gen: u8,
+) -> AppResult<()> {
     let rt = tokio::runtime::Runtime::new().unwrap();
-    rt.block_on(
-        notify(state, success, progress, message, mac, gen)
-    );
+    rt.block_on(notify(state, success, progress, message, mac, gen));
     Ok(())
 }
 
@@ -461,7 +531,21 @@ pub async fn run_flashwriter(
         started.elapsed().as_secs_f64(),
     );
 
-    notify(&state, result.is_ok(), Some(100), &format!("{}", result.as_ref().err().unwrap_or(&AppError::Msg("IPL completed successfully".into()))), &mac, gen).await;
+    notify(
+        &state,
+        result.is_ok(),
+        Some(100),
+        &format!(
+            "{}",
+            result
+                .as_ref()
+                .err()
+                .unwrap_or(&AppError::Msg("IPL completed successfully".into()))
+        ),
+        &mac,
+        gen,
+    )
+    .await;
     result
 }
 
@@ -547,7 +631,21 @@ pub async fn run_gen5(state: Arc<AppState>, job: Gen5Job) -> AppResult<()> {
     .await;
 
     global_metrics().record_firmware_flash(5, result.is_ok(), started.elapsed().as_secs_f64());
-    notify(&state, result.is_ok(), Some(100), &format!("{}", result.as_ref().err().unwrap_or(&AppError::Msg("IPL completed successfully".into()))), &mac, 5).await;
+    notify(
+        &state,
+        result.is_ok(),
+        Some(100),
+        &format!(
+            "{}",
+            result
+                .as_ref()
+                .err()
+                .unwrap_or(&AppError::Msg("IPL completed successfully".into()))
+        ),
+        &mac,
+        5,
+    )
+    .await;
     result
 }
 

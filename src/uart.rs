@@ -1,6 +1,9 @@
 //! Linux serial helpers and a bounded, buffered request/response channel.
 
-use crate::{constants::LOG_ROOT, error::{AppError, AppResult}};
+use crate::{
+    constants::LOG_ROOT,
+    error::{AppError, AppResult},
+};
 use serialport::SerialPort;
 use tracing::{error, info};
 
@@ -52,7 +55,12 @@ impl Console {
             pending: Vec::with_capacity(4096),
             uart_log: uart_log_prefix.map(|prefix| {
                 let log_path = Path::new(LOG_ROOT).join(format!("{prefix}.uart.log"));
-                OpenOptions::new().append(true).create(true).open(&log_path).unwrap()
+                OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&log_path)
+                    .unwrap()
             }),
         })
     }
@@ -114,7 +122,9 @@ impl Console {
             return Err(AppError::Msg("invalid UART prompt specification".into()));
         }
 
-        self.write_uart_log(format!("UART wait_any called with patterns: {:?}", patterns).as_bytes())?;
+        self.write_uart_log(
+            format!("UART wait_any called with patterns: {:?}", patterns).as_bytes(),
+        )?;
         let deadline = Instant::now() + timeout;
         let keep = patterns
             .iter()
@@ -143,7 +153,13 @@ impl Console {
             }
 
             if Instant::now() >= deadline {
-                self.write_uart_log(format!("UART wait_any timeout. expected one of the patterns: {:?}", patterns).as_bytes())?;
+                self.write_uart_log(
+                    format!(
+                        "UART wait_any timeout. expected one of the patterns: {:?}",
+                        patterns
+                    )
+                    .as_bytes(),
+                )?;
                 return Err(AppError::Msg(format!(
                     "UART prompt timeout; expected one of {:?}",
                     patterns
@@ -172,9 +188,10 @@ impl Console {
                         std::io::ErrorKind::TimedOut
                             | std::io::ErrorKind::WouldBlock
                             | std::io::ErrorKind::Interrupted
-                    ) => {
-                        self.write_uart_log(format!("UART read error: {error}").as_bytes())?;
-                    }
+                    ) =>
+                {
+                    self.write_uart_log(format!("UART read error: {error}").as_bytes())?;
+                }
                 Err(error) => return Err(error.into()),
             }
         }
@@ -202,13 +219,17 @@ impl Console {
 
             if count == 0 {
                 info!("Reached end of S-record file: {}", path.display());
-                self.write_uart_log(format!("Reached end of S-record file: {}\n", path.display()).as_bytes())?;
+                self.write_uart_log(
+                    format!("Reached end of S-record file: {}\n", path.display()).as_bytes(),
+                )?;
                 break;
             }
 
             if line.len() > 1024 {
                 error!("S-record line exceeds 1024 bytes in {}", path.display());
-                self.write_uart_log(format!("S-record line exceeds 1024 bytes in {}\n", path.display()).as_bytes())?;   
+                self.write_uart_log(
+                    format!("S-record line exceeds 1024 bytes in {}\n", path.display()).as_bytes(),
+                )?;
                 return Err(AppError::Msg(format!(
                     "S-record line exceeds 1024 bytes in {}",
                     path.display()
@@ -221,7 +242,9 @@ impl Console {
 
             if !line.starts_with(b"S") {
                 error!("invalid S-record line in {}", path.display());
-                self.write_uart_log(format!("invalid S-record line in {}\n", path.display()).as_bytes())?;
+                self.write_uart_log(
+                    format!("invalid S-record line in {}\n", path.display()).as_bytes(),
+                )?;
                 return Err(AppError::Msg(format!(
                     "invalid S-record line in {}",
                     path.display()
