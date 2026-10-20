@@ -382,7 +382,7 @@ fn flashwriter_sync(state: &AppState, target: &FlashWriterTarget, package: &Path
             notify_sync(
                 state,
                 true,
-                Some(0),
+                Some((completed * 100 / total) as u8),
                 &format!("Flashing image: {}", image.name),
                 &target.mac,
                 target.generation,
@@ -453,7 +453,7 @@ async fn notify(
     let flashing_status = serde_json::json!({
         "status": status,
         "percentage": progress,
-        "completed": success,
+        "completed": progress.unwrap_or(0) == 100,
         "mac": mac,
         "generation": gen,
         "message": message,
