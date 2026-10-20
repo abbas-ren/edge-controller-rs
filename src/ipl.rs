@@ -202,25 +202,39 @@ fn boot_sequence_levels(
 }
 
 fn set_boot_mode(state: &AppState, target: &FlashWriterTarget, download: bool) -> AppResult<()> {
+    info!(
+        "Setting boot mode for target: {}, download: {}",
+        target.serial, download
+    );
     let (initial_relay, gpio, final_relay) = boot_sequence_levels(
         target.gpio_default_level,
         target.relay_default_level,
         download,
     );
+    info!(
+        "Boot sequence levels - initial_relay: {:?}, gpio: {:?}, final_relay: {:?}",
+        initial_relay, gpio, final_relay
+    );
 
     state
         .relay
         .set_channel(&target.serial, target.channel, initial_relay.is_high())?;
+    info!("Initial relay set to: {:?}", initial_relay.is_high());
 
     std::thread::sleep(seconds(2));
+    info!("Sleeping for 2 seconds before setting GPIO");
 
+    info!("Setting GPIO to: {:?}", gpio.is_high());
     GpioController::set(target.gpio, gpio.is_high())?;
 
     std::thread::sleep(seconds(2));
+    info!("Sleeping for 2 seconds before setting final relay");
 
     state
         .relay
-        .set_channel(&target.serial, target.channel, final_relay.is_high())
+        .set_channel(&target.serial, target.channel, final_relay.is_high())?;
+    info!("Final relay set to: {:?}", final_relay.is_high());
+    Ok(())
 }
 
 /// Enter SCIF download mode, opening UART before the boot begins.
@@ -240,6 +254,10 @@ fn download_console(
 }
 
 fn combine(operation: AppResult<()>, cleanup: AppResult<()>) -> AppResult<()> {
+    info!(
+        "Combining operation and cleanup results: operation = {:?}, cleanup = {:?}",
+        operation, cleanup
+    );
     match (operation, cleanup) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
