@@ -197,7 +197,11 @@ fn boot_sequence_levels(
             relay_default_level,
         )
     } else {
-        (relay_default_level, gpio_default_level, relay_default_level)
+        (
+            relay_default_level.inverse(),
+            gpio_default_level,
+            relay_default_level,
+        )
     }
 }
 
