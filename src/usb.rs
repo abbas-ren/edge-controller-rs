@@ -42,6 +42,7 @@ pub struct UsbTty {
 }
 
 fn numbered_tty(name: &str) -> bool {
+    let _api_trace = crate::observability::ApiTrace::enter("usb", "numbered_tty");
     ["ttyUSB", "ttyACM"].iter().any(|prefix| {
         name.strip_prefix(prefix).is_some_and(|suffix| {
             !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
@@ -50,6 +51,7 @@ fn numbered_tty(name: &str) -> bool {
 }
 
 fn read_hex(path: &Path) -> AppResult<u16> {
+    let _api_trace = crate::observability::ApiTrace::enter("usb", "read_hex");
     let value = fs::read_to_string(path)?;
 
     u16::from_str_radix(value.trim(), 16).map_err(|_| {
@@ -65,6 +67,7 @@ fn read_hex(path: &Path) -> AppResult<u16> {
 /// Linux drivers place TTY nodes at different depths. Walk ancestors until
 /// both the interface descriptor and owning USB device are found.
 fn inspect_tty(tty: String, device_path: PathBuf) -> AppResult<Option<UsbTty>> {
+    let _api_trace = crate::observability::ApiTrace::enter("usb", "inspect_tty");
     let mut interface = None;
 
     for ancestor in device_path.ancestors() {
@@ -132,6 +135,7 @@ fn inspect_tty(tty: String, device_path: PathBuf) -> AppResult<Option<UsbTty>> {
 /// Filesystem-only scanner, separated from character-device validation so
 /// tests can use a synthetic sysfs tree without root privileges.
 fn scan_at(class_tty: &Path, dev_root: &Path) -> AppResult<Vec<UsbTty>> {
+    let _api_trace = crate::observability::ApiTrace::enter("usb", "scan_at");
     let mut devices = Vec::new();
 
     for entry in fs::read_dir(class_tty)? {
@@ -177,6 +181,7 @@ fn scan_at(class_tty: &Path, dev_root: &Path) -> AppResult<Vec<UsbTty>> {
 
 /// Enumerate USB serial ports whose /dev nodes currently exist.
 pub fn inventory() -> AppResult<Vec<UsbTty>> {
+    let _api_trace = crate::observability::ApiTrace::enter("usb", "inventory");
     tracing::debug!("enumerating USB serial device inventory");
     let scanned = scan_at(Path::new("/sys/class/tty"), Path::new("/dev"))?;
     let mut devices = Vec::with_capacity(scanned.len());
@@ -206,6 +211,7 @@ pub fn inventory() -> AppResult<Vec<UsbTty>> {
 }
 
 fn inventory_paths(devices: &[UsbTty], vid: u16, pid: u16) -> Vec<String> {
+    let _api_trace = crate::observability::ApiTrace::enter("usb", "inventory_paths");
     devices
         .iter()
         .filter(|device| device.vid == vid && device.pid == pid && device.interface == 0)
@@ -220,6 +226,7 @@ fn inventory_paths(devices: &[UsbTty], vid: u16, pid: u16) -> Vec<String> {
 /// The two inventory files are diagnostic snapshots, not transactional
 /// authoritative mappings.
 fn write_inventory(path: &Path, lines: &[String]) -> AppResult<()> {
+    let _api_trace = crate::observability::ApiTrace::enter("usb", "write_inventory");
     let parent = path
         .parent()
         .ok_or_else(|| AppError::Msg("inventory file has no parent directory".into()))?;
@@ -243,6 +250,7 @@ fn write_inventory(path: &Path, lines: &[String]) -> AppResult<()> {
 
 /// Discover inventory only. This does not infer UART/power wiring.
 pub fn discover_gen5_ttys() -> AppResult<(Vec<String>, Vec<String>)> {
+    let _api_trace = crate::observability::ApiTrace::enter("usb", "discover_gen5_ttys");
     let devices = inventory()?;
 
     let uarts = inventory_paths(&devices, 0x0403, 0x6010);
@@ -261,6 +269,7 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     fn fake_tty(root: &Path, name: &str, physical: &str, interface: u8, serial: &str) {
+        let _api_trace = crate::observability::ApiTrace::enter("usb", "fake_tty");
         let usb = root.join("devices").join(physical);
         fs::create_dir_all(&usb).unwrap();
         fs::write(usb.join("idVendor"), "0403\n").unwrap();
@@ -283,6 +292,7 @@ mod tests {
 
     #[test]
     fn recognizes_only_numbered_usb_and_acm_names() {
+        let _api_trace = crate::observability::ApiTrace::enter("usb", "recognizes_only_numbered_usb_and_acm_names");
         for accepted in ["ttyUSB0", "ttyUSB12", "ttyACM0"] {
             assert!(numbered_tty(accepted));
         }
@@ -294,6 +304,7 @@ mod tests {
 
     #[test]
     fn discovers_nested_tty_and_keeps_interfaces_separate() {
+        let _api_trace = crate::observability::ApiTrace::enter("usb", "discovers_nested_tty_and_keeps_interfaces_separate");
         let temp = tempfile::tempdir().unwrap();
         fake_tty(temp.path(), "ttyUSB8", "1-2", 0, "BOARD-A");
         fake_tty(temp.path(), "ttyUSB9", "1-2", 1, "BOARD-A");
@@ -312,6 +323,7 @@ mod tests {
 
     #[test]
     fn absent_interface_is_not_replaced_with_another_interface() {
+        let _api_trace = crate::observability::ApiTrace::enter("usb", "absent_interface_is_not_replaced_with_another_interface");
         let temp = tempfile::tempdir().unwrap();
         fake_tty(temp.path(), "ttyUSB4", "1-2", 1, "BOARD-A");
 

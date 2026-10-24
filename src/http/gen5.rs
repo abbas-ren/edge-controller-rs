@@ -14,6 +14,7 @@ pub async fn gen5_tty_entry_handler(
     State(state): State<Arc<AppState>>,
     Json(request): Json<super::Gen5TtyRequest>,
 ) -> impl axum::response::IntoResponse {
+    let _api_trace = crate::observability::ApiTrace::enter("http::gen5", "gen5_tty_entry_handler");
     super::gen5_tty_entry(State(state), Json(request)).await
 }
 
@@ -23,6 +24,7 @@ pub async fn gen5_power_handler(
     Extension(lease): Extension<Lease>,
     Json(request): Json<super::Gen5PowerRequest>,
 ) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http::gen5", "gen5_power_handler");
     super::gen5_power(State(state), Extension(lease), Json(request)).await
 }
 
@@ -31,5 +33,6 @@ pub async fn mapping_entry_handler(
     State(state): State<Arc<AppState>>,
     Json(request): Json<super::MappingEntryRequest>,
 ) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http::gen5", "mapping_entry_handler");
     super::mapping_entry(State(state), Json(request)).await
 }

@@ -25,6 +25,7 @@ use std::{
 use tracing::{error, info};
 
 pub fn supports_relay_flash(generation: u8) -> bool {
+    let _api_trace = crate::observability::ApiTrace::enter("ipl", "supports_relay_flash");
     matches!(generation, 3 | 4)
 }
 
@@ -113,6 +114,7 @@ pub struct Gen5Job {
 /// hostile local rename races additionally requires trusted ownership of
 /// the directory tree.
 pub fn package_directory(value: &str) -> AppResult<PathBuf> {
+    let _api_trace = crate::observability::ApiTrace::enter("ipl", "package_directory");
     let root = fs::canonicalize(FIRMWARE_ROOT)?;
     let package = fs::canonicalize(value)?;
 
@@ -126,6 +128,7 @@ pub fn package_directory(value: &str) -> AppResult<PathBuf> {
 }
 
 fn image_file(package: &Path, name: &str) -> AppResult<PathBuf> {
+    let _api_trace = crate::observability::ApiTrace::enter("ipl", "image_file");
     let path = fs::canonicalize(package.join(name))?;
     let metadata = fs::metadata(&path)?;
 
@@ -143,6 +146,7 @@ fn image_file(package: &Path, name: &str) -> AppResult<PathBuf> {
 }
 
 pub fn preflight_flashwriter(package: &Path) -> AppResult<()> {
+    let _api_trace = crate::observability::ApiTrace::enter("ipl", "preflight_flashwriter");
     image_file(package, FLASHWRITER)?;
 
     for image in &IMAGES {
@@ -153,6 +157,7 @@ pub fn preflight_flashwriter(package: &Path) -> AppResult<()> {
 }
 
 pub fn gen5_script() -> AppResult<PathBuf> {
+    let _api_trace = crate::observability::ApiTrace::enter("ipl", "gen5_script");
     use std::os::unix::fs::PermissionsExt;
 
     let path = PathBuf::from(
@@ -179,6 +184,7 @@ pub fn gen5_script() -> AppResult<PathBuf> {
 }
 
 fn seconds(value: u64) -> Duration {
+    let _api_trace = crate::observability::ApiTrace::enter("ipl", "seconds");
     Duration::from_secs(value)
 }
 
@@ -190,6 +196,7 @@ fn boot_sequence_levels(
     relay_default_level: VoltageLevel,
     download: bool,
 ) -> (VoltageLevel, VoltageLevel, VoltageLevel) {
+    let _api_trace = crate::observability::ApiTrace::enter("ipl", "boot_sequence_levels");
     if download {
         (
             relay_default_level.inverse(),
@@ -206,6 +213,7 @@ fn boot_sequence_levels(
 }
 
 fn set_boot_mode(state: &AppState, target: &FlashWriterTarget, download: bool) -> AppResult<()> {
+    let _api_trace = crate::observability::ApiTrace::enter("ipl", "set_boot_mode");
     info!(
         "Setting boot mode for target: {}, download: {}",
         target.serial, download
@@ -247,6 +255,7 @@ fn download_console(
     target: &FlashWriterTarget,
     prefix: Option<&str>,
 ) -> AppResult<Console> {
+    let _api_trace = crate::observability::ApiTrace::enter("ipl", "download_console");
     let mut console = Console::open(&target.tty, 921_600, prefix)?;
     console.clear_input()?;
 
@@ -258,6 +267,7 @@ fn download_console(
 }
 
 fn combine(operation: AppResult<()>, cleanup: AppResult<()>) -> AppResult<()> {
+    let _api_trace = crate::observability::ApiTrace::enter("ipl", "combine");
     info!(
         "Combining operation and cleanup results: operation = {:?}, cleanup = {:?}",
         operation, cleanup
@@ -277,6 +287,7 @@ fn combine(operation: AppResult<()>, cleanup: AppResult<()>) -> AppResult<()> {
 /// legacy default-mode handler, normal boot does not wait for a download
 /// prompt that should not appear.
 pub fn mode_sync(state: &AppState, target: &FlashWriterTarget, download: bool) -> AppResult<()> {
+    let _api_trace = crate::observability::ApiTrace::enter("ipl", "mode_sync");
     if !download {
         return set_boot_mode(state, target, false);
     }
@@ -291,6 +302,7 @@ pub fn mode_sync(state: &AppState, target: &FlashWriterTarget, download: bool) -
 }
 
 fn transfer_image(console: &mut Console, package: &Path, image: &Image) -> AppResult<()> {
+    let _api_trace = crate::observability::ApiTrace::enter("ipl", "transfer_image");
     let file = image_file(package, image.name)?;
 
     if image.emmc {
@@ -344,6 +356,7 @@ fn transfer_image(console: &mut Console, package: &Path, image: &Image) -> AppRe
 }
 
 fn log_file(generation: u8, mac: &str) -> AppResult<(PathBuf, File)> {
+    let _api_trace = crate::observability::ApiTrace::enter("ipl", "log_file");
     // The MAC used in a filename must already be normalized and validated.
     if mac.len() != 12 || !mac.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(AppError::Msg("invalid log identity".into()));
@@ -362,6 +375,7 @@ fn log_file(generation: u8, mac: &str) -> AppResult<(PathBuf, File)> {
 }
 
 fn flashwriter_sync(state: &AppState, target: &FlashWriterTarget, package: &Path) -> AppResult<()> {
+    let _api_trace = crate::observability::ApiTrace::enter("ipl", "flashwriter_sync");
     preflight_flashwriter(package)?;
     let (_, mut log) = log_file(target.generation, &target.mac)?;
 
@@ -448,6 +462,7 @@ fn flashwriter_sync(state: &AppState, target: &FlashWriterTarget, package: &Path
 }
 
 fn completion_endpoint(generation: u8) -> &'static str {
+    let _api_trace = crate::observability::ApiTrace::enter("ipl", "completion_endpoint");
     if supports_relay_flash(generation) {
         "flash-confirm-gen4"
     } else {
@@ -463,6 +478,7 @@ async fn notify(
     mac: &str,
     gen: u8,
 ) {
+    let _api_trace = crate::observability::ApiTrace::enter("ipl", "notify");
     let endpoint = completion_endpoint(gen);
 
     let status = if success { "success" } else { "failure" };
@@ -516,6 +532,7 @@ fn notify_sync(
     mac: &str,
     gen: u8,
 ) -> AppResult<()> {
+    let _api_trace = crate::observability::ApiTrace::enter("ipl", "notify_sync");
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(notify(state, success, progress, message, mac, gen));
     Ok(())
@@ -526,6 +543,7 @@ pub async fn run_flashwriter(
     target: FlashWriterTarget,
     package: PathBuf,
 ) -> AppResult<()> {
+    let _api_trace = crate::observability::ApiTrace::enter("ipl", "run_flashwriter");
     let generation = target.generation;
     let started = std::time::Instant::now();
     let worker_state = state.clone();
@@ -569,6 +587,7 @@ pub async fn run_flashwriter(
 
 /// Search a log with bounded memory, including matches across read boundaries.
 fn contains_success_marker(path: &Path) -> AppResult<bool> {
+    let _api_trace = crate::observability::ApiTrace::enter("ipl", "contains_success_marker");
     const MARKER: &[u8] = b"Flash process completed successfully";
 
     let mut file = File::open(path)?;
@@ -602,6 +621,7 @@ fn contains_success_marker(path: &Path) -> AppResult<bool> {
 /// Success requires BOTH a zero exit status and the legacy success marker.
 /// stdout/stderr stream to disk rather than accumulating in memory.
 pub async fn run_gen5(state: Arc<AppState>, job: Gen5Job) -> AppResult<()> {
+    let _api_trace = crate::observability::ApiTrace::enter("ipl", "run_gen5");
     let started = std::time::Instant::now();
     let mac = job.mac.clone();
     let result: AppResult<()> = async {
@@ -676,6 +696,7 @@ mod tests {
     use std::{fs, os::unix::fs::symlink};
 
     fn complete_package() -> tempfile::TempDir {
+        let _api_trace = crate::observability::ApiTrace::enter("ipl", "complete_package");
         let package = tempfile::tempdir().unwrap();
         fs::write(package.path().join(FLASHWRITER), b"flashwriter").unwrap();
         for image in &IMAGES {
@@ -686,6 +707,7 @@ mod tests {
 
     #[test]
     fn gen3_and_gen4_share_the_relay_flash_protocol() {
+        let _api_trace = crate::observability::ApiTrace::enter("ipl", "gen3_and_gen4_share_the_relay_flash_protocol");
         assert!(supports_relay_flash(3));
         assert!(supports_relay_flash(4));
         assert!(!supports_relay_flash(5));
@@ -696,6 +718,7 @@ mod tests {
 
     #[test]
     fn low_defaults_preserve_the_download_pulse_and_normal_resting_levels() {
+        let _api_trace = crate::observability::ApiTrace::enter("ipl", "low_defaults_preserve_the_download_pulse_and_normal_resting_levels");
         assert_eq!(
             boot_sequence_levels(VoltageLevel::Low, VoltageLevel::Low, true),
             (VoltageLevel::High, VoltageLevel::High, VoltageLevel::Low)
@@ -708,12 +731,14 @@ mod tests {
 
     #[test]
     fn preflight_accepts_a_complete_nonempty_package() {
+        let _api_trace = crate::observability::ApiTrace::enter("ipl", "preflight_accepts_a_complete_nonempty_package");
         let package = complete_package();
         assert!(preflight_flashwriter(package.path()).is_ok());
     }
 
     #[test]
     fn preflight_rejects_missing_and_empty_images() {
+        let _api_trace = crate::observability::ApiTrace::enter("ipl", "preflight_rejects_missing_and_empty_images");
         let package = complete_package();
         fs::remove_file(package.path().join(IMAGES[0].name)).unwrap();
         assert!(preflight_flashwriter(package.path()).is_err());
@@ -724,6 +749,7 @@ mod tests {
 
     #[test]
     fn preflight_rejects_an_image_symlink_outside_the_package() {
+        let _api_trace = crate::observability::ApiTrace::enter("ipl", "preflight_rejects_an_image_symlink_outside_the_package");
         let package = complete_package();
         let outside = tempfile::NamedTempFile::new().unwrap();
         let image = package.path().join(IMAGES[0].name);
@@ -735,6 +761,7 @@ mod tests {
 
     #[test]
     fn success_marker_is_detected_across_read_boundaries() {
+        let _api_trace = crate::observability::ApiTrace::enter("ipl", "success_marker_is_detected_across_read_boundaries");
         let log = tempfile::NamedTempFile::new().unwrap();
         let mut contents = vec![b'x'; 4090];
         contents.extend_from_slice(b"Flash process completed successfully\n");

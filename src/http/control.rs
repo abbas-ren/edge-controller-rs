@@ -32,6 +32,7 @@ enum ControlAction {
 }
 
 pub async fn get(State(state): State<Arc<AppState>>) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http::control", "get");
     Json(snapshot(&state).await).into_response()
 }
 
@@ -39,6 +40,7 @@ pub async fn patch(
     State(state): State<Arc<AppState>>,
     Json(patch): Json<ControlPatch>,
 ) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http::control", "patch");
     let previous = control::current();
     let next = match control::apply(patch) {
         Ok(settings) => settings,
@@ -71,6 +73,7 @@ pub async fn action(
     State(state): State<Arc<AppState>>,
     Json(request): Json<ControlActionRequest>,
 ) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http::control", "action");
     let result = match request.action {
         ControlAction::Restart => {
             schedule_restart();
@@ -103,6 +106,7 @@ pub async fn action(
 }
 
 async fn snapshot(state: &AppState) -> serde_json::Value {
+    let _api_trace = crate::observability::ApiTrace::enter("http::control", "snapshot");
     let settings = control::current();
     let gpio_header_pins = crate::gpio::HEADER_PINS
         .iter()
@@ -192,6 +196,7 @@ async fn snapshot(state: &AppState) -> serde_json::Value {
 }
 
 async fn reload_mappings(state: &AppState) -> crate::error::AppResult<()> {
+    let _api_trace = crate::observability::ApiTrace::enter("http::control", "reload_mappings");
     let paths = control::paths();
     let (usb, gen5, uart) = tokio::task::spawn_blocking(move || {
         let (usb, gen5) = crate::store::load_mappings(&paths.usb, &paths.gen5)?;
@@ -209,6 +214,7 @@ async fn reload_mappings(state: &AppState) -> crate::error::AppResult<()> {
 }
 
 async fn clear_usb_mappings(state: &AppState) -> crate::error::AppResult<()> {
+    let _api_trace = crate::observability::ApiTrace::enter("http::control", "clear_usb_mappings");
     let mappings = UsbMappings::new();
     let contents = crate::store::encode_usb(&mappings)?;
     crate::store::atomic_replace(&control::paths().usb, contents.as_bytes())?;
@@ -217,6 +223,7 @@ async fn clear_usb_mappings(state: &AppState) -> crate::error::AppResult<()> {
 }
 
 async fn clear_gen5_mappings(state: &AppState) -> crate::error::AppResult<()> {
+    let _api_trace = crate::observability::ApiTrace::enter("http::control", "clear_gen5_mappings");
     let mappings = Gen5Mappings::new();
     let contents = crate::store::encode_gen5(&mappings)?;
     crate::store::atomic_replace(&control::paths().gen5, contents.as_bytes())?;
@@ -225,6 +232,7 @@ async fn clear_gen5_mappings(state: &AppState) -> crate::error::AppResult<()> {
 }
 
 async fn clear_uart_mappings(state: &AppState) -> crate::error::AppResult<()> {
+    let _api_trace = crate::observability::ApiTrace::enter("http::control", "clear_uart_mappings");
     let mappings: UartMappings = HashMap::new();
     let contents = crate::store::encode_uart(&mappings)?;
     crate::store::atomic_replace(&control::paths().uart, contents.as_bytes())?;
@@ -233,6 +241,7 @@ async fn clear_uart_mappings(state: &AppState) -> crate::error::AppResult<()> {
 }
 
 fn schedule_restart() {
+    let _api_trace = crate::observability::ApiTrace::enter("http::control", "schedule_restart");
     tokio::spawn(async {
         tokio::time::sleep(Duration::from_millis(750)).await;
         match tokio::process::Command::new("systemctl")

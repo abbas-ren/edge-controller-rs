@@ -10,6 +10,7 @@ pub async fn rtos_start_handler(
     State(state): State<Arc<AppState>>,
     Json(request): Json<super::RtosStartRequest>,
 ) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http::rtos", "rtos_start_handler");
     super::rtos_start(State(state), Json(request)).await
 }
 
@@ -18,5 +19,6 @@ pub async fn rtos_end_handler(
     State(state): State<Arc<AppState>>,
     Json(request): Json<super::RtosEndRequest>,
 ) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http::rtos", "rtos_end_handler");
     super::rtos_end(State(state), Json(request)).await
 }

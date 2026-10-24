@@ -15,6 +15,7 @@ pub async fn relay_handler(
     Extension(lease): Extension<Lease>,
     Json(request): Json<super::RelayRequest>,
 ) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http::relay", "relay_handler");
     super::relay(State(state), Extension(lease), Json(request)).await
 }
 
@@ -24,6 +25,7 @@ pub async fn relay_status_handler(
     Extension(lease): Extension<Lease>,
     Json(request): Json<super::RelayStatusRequest>,
 ) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http::relay", "relay_status_handler");
     super::relay_status(State(state), Extension(lease), Json(request)).await
 }
 
@@ -33,6 +35,7 @@ pub async fn relay_identity_handler(
     Extension(lease): Extension<Lease>,
     Json(request): Json<super::RelayIdentityUpdateRequest>,
 ) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http::relay", "relay_identity_handler");
     super::relay_identity(State(state), Extension(lease), Json(request)).await
 }
 
@@ -41,6 +44,7 @@ pub async fn relay_config_handler(
     State(state): State<Arc<AppState>>,
     Json(request): Json<super::RelayConfigRequest>,
 ) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http::relay", "relay_config_handler");
     super::relay_config(State(state), Json(request)).await
 }
 
@@ -49,6 +53,7 @@ pub async fn relay_delete_handler(
     State(state): State<Arc<AppState>>,
     Json(request): Json<super::DeleteRequest>,
 ) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http::relay", "relay_delete_handler");
     super::relay_delete(State(state), Json(request)).await
 }
 
@@ -57,5 +62,6 @@ pub async fn devcon_delete_handler(
     State(state): State<Arc<AppState>>,
     Json(request): Json<super::DeleteRequest>,
 ) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http::relay", "devcon_delete_handler");
     super::devcon_delete(State(state), Json(request)).await
 }

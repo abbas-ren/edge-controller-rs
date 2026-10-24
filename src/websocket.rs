@@ -51,6 +51,7 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const PONG_TIMEOUT: Duration = Duration::from_secs(70);
 
 fn next_retry_delay(current: Duration, session_elapsed: Duration) -> Duration {
+    let _api_trace = crate::observability::ApiTrace::enter("websocket", "next_retry_delay");
     if session_elapsed >= Duration::from_secs(30) {
         Duration::from_secs(2)
     } else {
@@ -59,6 +60,7 @@ fn next_retry_delay(current: Duration, session_elapsed: Duration) -> Duration {
 }
 
 async fn send(socket: &mut Socket, message: Message) -> AppResult<()> {
+    let _api_trace = crate::observability::ApiTrace::enter("websocket", "send");
     time::timeout(WRITE_TIMEOUT, socket.send(message))
         .await
         .map_err(|_| AppError::Msg("WebSocket write timed out".into()))?
@@ -69,6 +71,7 @@ fn connection_request(
     state: &AppState,
     uid: &str,
 ) -> AppResult<tokio_tungstenite::tungstenite::http::Request<()>> {
+    let _api_trace = crate::observability::ApiTrace::enter("websocket", "connection_request");
     let mut url = reqwest::Url::parse(&format!(
         "ws://{}:{}/ws",
         state.cfg.server_ip, state.cfg.ws_port
@@ -94,6 +97,7 @@ async fn connection_session(
     uid: &str,
     sampler: Arc<Mutex<MetricSampler>>,
 ) -> AppResult<()> {
+    let _api_trace = crate::observability::ApiTrace::enter("websocket", "connection_session");
     let request = connection_request(state, uid)?;
 
     let mut config = WebSocketConfig::default();
@@ -255,6 +259,7 @@ async fn connection_session(
 }
 
 pub async fn websocket_loop(state: Arc<AppState>) {
+    let _api_trace = crate::observability::ApiTrace::enter("websocket", "websocket_loop");
     let sampler = Arc::new(Mutex::new(MetricSampler::default()));
     let mut retry_delay = Duration::from_secs(2);
 
@@ -310,6 +315,7 @@ mod tests {
 
     #[test]
     fn reconnect_backoff_resets_after_a_stable_session() {
+        let _api_trace = crate::observability::ApiTrace::enter("websocket", "reconnect_backoff_resets_after_a_stable_session");
         assert_eq!(
             next_retry_delay(Duration::from_secs(2), Duration::from_secs(31)),
             Duration::from_secs(2)

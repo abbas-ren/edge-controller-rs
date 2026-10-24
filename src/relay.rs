@@ -32,12 +32,14 @@ const TRANSFER_TIMEOUT: Duration = Duration::from_secs(1);
 static RELAY_LOCK: Mutex<()> = Mutex::new(());
 
 fn lock_relays() -> AppResult<MutexGuard<'static, ()>> {
+    let _api_trace = crate::observability::ApiTrace::enter("relay", "lock_relays");
     RELAY_LOCK
         .lock()
         .map_err(|_| AppError::Msg("relay mutex was poisoned".into()))
 }
 
 fn usb_error(operation: &str, error: rusb::Error) -> AppError {
+    let _api_trace = crate::observability::ApiTrace::enter("relay", "usb_error");
     AppError::Msg(format!("{operation}: {error}"))
 }
 
@@ -51,6 +53,7 @@ struct Session {
 
 impl Session {
     fn open(handle: DeviceHandle<Context>) -> AppResult<Self> {
+        let _api_trace = crate::observability::ApiTrace::enter("relay", "open");
         match handle.kernel_driver_active(INTERFACE) {
             Ok(true) => {
                 handle
@@ -85,6 +88,7 @@ impl Session {
     }
 
     fn read_state(&self) -> AppResult<u8> {
+        let _api_trace = crate::observability::ApiTrace::enter("relay", "read_state");
         let mut response = [0_u8; 2];
 
         let count = self
@@ -102,6 +106,7 @@ impl Session {
     }
 
     fn write_state(&self, state: u8) -> AppResult<()> {
+        let _api_trace = crate::observability::ApiTrace::enter("relay", "write_state");
         let count = self
             .handle
             .write_bulk(ENDPOINT, &[state], TRANSFER_TIMEOUT)
@@ -162,6 +167,7 @@ impl RelayController {
     }
 
     fn parse_vid_pid(value: &str) -> AppResult<(u16, u16)> {
+        let _api_trace = crate::observability::ApiTrace::enter("relay", "parse_vid_pid");
         let (vid, pid) = value
             .split_once(':')
             .ok_or_else(|| AppError::Msg("VID:PID must contain one ':' separator".into()))?;
@@ -179,6 +185,7 @@ impl RelayController {
 
     /// Validate VID:PID and use an optional serial, discovering iSerial when absent.
     pub fn resolve(selector: RelaySelector) -> AppResult<RelayIdentity> {
+        let _api_trace = crate::observability::ApiTrace::enter("relay", "resolve");
         let vid_pid = selector
             .vid_pid
             .as_deref()
@@ -198,6 +205,7 @@ impl RelayController {
     }
 
     fn discover_serial(vid: u16, pid: u16) -> AppResult<RelayIdentity> {
+        let _api_trace = crate::observability::ApiTrace::enter("relay", "discover_serial");
         let context = Context::new().map_err(|error| usb_error("initializing libusb", error))?;
         let devices = context
             .devices()
@@ -241,6 +249,7 @@ impl RelayController {
 
     /// Return the currently active relay identity.
     pub fn identity(&self) -> AppResult<RelayIdentity> {
+        let _api_trace = crate::observability::ApiTrace::enter("relay", "identity");
         self.identity
             .read()
             .map_err(|_| AppError::Msg("relay identity lock was poisoned".into()))?
@@ -250,6 +259,7 @@ impl RelayController {
 
     /// Replace the active relay identity without restarting the service.
     pub fn update_identity(&self, identity: RelayIdentity) -> AppResult<()> {
+        let _api_trace = crate::observability::ApiTrace::enter("relay", "update_identity");
         *self
             .identity
             .write()
@@ -259,6 +269,7 @@ impl RelayController {
     }
 
     fn validate_channel(channel: u8) -> AppResult<()> {
+        let _api_trace = crate::observability::ApiTrace::enter("relay", "validate_channel");
         if channel > 7 {
             return Err(AppError::Msg(
                 "relay channel must be between 0 and 7".into(),
@@ -269,6 +280,7 @@ impl RelayController {
     }
 
     fn find(identity: &RelayIdentity) -> AppResult<DeviceHandle<Context>> {
+        let _api_trace = crate::observability::ApiTrace::enter("relay", "find");
         let serial = &identity.serial_number;
         if serial.is_empty() || serial.chars().any(char::is_control) {
             return Err(AppError::Msg("invalid relay serial number".into()));
@@ -316,6 +328,7 @@ impl RelayController {
     }
 
     pub fn set_channel(&self, serial: &str, channel: u8, on: bool) -> AppResult<()> {
+        let _api_trace = crate::observability::ApiTrace::enter("relay", "set_channel");
         Self::validate_channel(channel)?;
         let identity = self.identity()?;
         if serial != identity.serial_number {
@@ -360,6 +373,7 @@ impl RelayController {
     }
 
     pub fn channel_status(&self, serial: &str, channel: u8) -> AppResult<u8> {
+        let _api_trace = crate::observability::ApiTrace::enter("relay", "channel_status");
         Self::validate_channel(channel)?;
         let identity = self.identity()?;
         if serial != identity.serial_number {
@@ -383,6 +397,7 @@ impl RelayController {
     /// Device failures are logged and omitted from the inventory. An empty
     /// result means "no readable relays", not necessarily "none attached".
     pub fn inventory(&self) -> Vec<RelayInventory> {
+        let _api_trace = crate::observability::ApiTrace::enter("relay", "inventory");
         tracing::debug!("enumerating relay inventory");
 
         let _guard = match lock_relays() {
@@ -438,6 +453,7 @@ mod tests {
 
     #[test]
     fn relay_serial_requires_vid_pid() {
+        let _api_trace = crate::observability::ApiTrace::enter("relay", "relay_serial_requires_vid_pid");
         let result = RelayController::resolve(RelaySelector {
             serial_number: Some("RELAY-A".to_owned()),
             vid_pid: None,
@@ -451,6 +467,7 @@ mod tests {
 
     #[test]
     fn relay_serial_and_vid_pid_resolve_without_usb_discovery() {
+        let _api_trace = crate::observability::ApiTrace::enter("relay", "relay_serial_and_vid_pid_resolve_without_usb_discovery");
         let identity = RelayController::resolve(RelaySelector {
             serial_number: Some("RELAY-A".to_owned()),
             vid_pid: Some("0403:6001".to_owned()),
@@ -463,6 +480,7 @@ mod tests {
 
     #[test]
     fn valid_channels_are_zero_through_seven() {
+        let _api_trace = crate::observability::ApiTrace::enter("relay", "valid_channels_are_zero_through_seven");
         for channel in 0..8 {
             assert!(RelayController::validate_channel(channel).is_ok());
         }
@@ -470,6 +488,7 @@ mod tests {
 
     #[test]
     fn invalid_channels_are_rejected_before_usb_access() {
+        let _api_trace = crate::observability::ApiTrace::enter("relay", "invalid_channels_are_rejected_before_usb_access");
         for channel in [8, 16, 255] {
             assert!(RelayController::validate_channel(channel).is_err());
         }

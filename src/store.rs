@@ -47,6 +47,7 @@ const MAX_ROW_BYTES: usize = 1024;
 const MAX_UID_BYTES: usize = 128;
 
 fn invalid(message: impl Into<String>) -> AppError {
+    let _api_trace = crate::observability::ApiTrace::enter("store", "invalid");
     AppError::Msg(message.into())
 }
 
@@ -54,6 +55,7 @@ fn invalid(message: impl Into<String>) -> AppError {
 ///
 /// O_NONBLOCK prevents hanging on a FIFO before metadata rejects it.
 fn open_regular(path: &Path) -> AppResult<Option<File>> {
+    let _api_trace = crate::observability::ApiTrace::enter("store", "open_regular");
     let file = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -79,6 +81,7 @@ fn open_regular(path: &Path) -> AppResult<Option<File>> {
 }
 
 pub fn read_optional_text(path: &Path, limit: usize) -> AppResult<Option<String>> {
+    let _api_trace = crate::observability::ApiTrace::enter("store", "read_optional_text");
     let Some(file) = open_regular(path)? else {
         tracing::debug!(
             path = %path.display(),
@@ -117,6 +120,7 @@ pub fn read_optional_text(path: &Path, limit: usize) -> AppResult<Option<String>
 }
 
 pub fn read_required_text(path: &Path, limit: usize) -> AppResult<String> {
+    let _api_trace = crate::observability::ApiTrace::enter("store", "read_required_text");
     match read_optional_text(path, limit)? {
         Some(text) => {
             tracing::debug!(path = %path.display(), bytes = text.len(), "required configuration file loaded");
@@ -139,6 +143,7 @@ pub fn read_required_text(path: &Path, limit: usize) -> AppResult<String> {
 ///
 /// Do not erase arbitrary separators or whitespace before validation.
 pub fn checked_mac(value: &str) -> AppResult<String> {
+    let _api_trace = crate::observability::ApiTrace::enter("store", "checked_mac");
     let bytes = value.as_bytes();
 
     let valid = match bytes.len() {
@@ -169,6 +174,7 @@ pub fn checked_mac(value: &str) -> AppResult<String> {
 }
 
 pub fn validate_serial(value: &str) -> AppResult<()> {
+    let _api_trace = crate::observability::ApiTrace::enter("store", "validate_serial");
     if value.is_empty()
         || value.len() > 255
         || !value
@@ -189,6 +195,7 @@ pub fn validate_serial(value: &str) -> AppResult<()> {
 /// Other path forms must be migrated explicitly rather than silently
 /// canonicalized during startup.
 pub fn validate_tty(value: &str) -> AppResult<()> {
+    let _api_trace = crate::observability::ApiTrace::enter("store", "validate_tty");
     let valid = ["/dev/ttyUSB", "/dev/ttyACM"].iter().any(|prefix| {
         value.strip_prefix(prefix).is_some_and(|suffix| {
             !suffix.is_empty()
@@ -210,6 +217,7 @@ pub fn validate_tty(value: &str) -> AppResult<()> {
 /// Permit the common UUID/token characters without admitting whitespace,
 /// control characters, URL delimiters, or unbounded values.
 pub fn validate_uid(value: &str) -> AppResult<()> {
+    let _api_trace = crate::observability::ApiTrace::enter("store", "validate_uid");
     if value.is_empty()
         || value.len() > MAX_UID_BYTES
         || !value
@@ -225,6 +233,7 @@ pub fn validate_uid(value: &str) -> AppResult<()> {
 }
 
 pub fn load_uid(path: &Path) -> AppResult<Option<String>> {
+    let _api_trace = crate::observability::ApiTrace::enter("store", "load_uid");
     let Some(text) = read_optional_text(path, MAX_UID_BYTES + 2)? else {
         tracing::debug!(path = %path.display(), "UID not present; controller not yet confirmed");
         return Ok(None);
@@ -244,6 +253,7 @@ pub fn load_uid(path: &Path) -> AppResult<Option<String>> {
 }
 
 fn parse_rows(text: &str, columns: usize) -> AppResult<Vec<Vec<&str>>> {
+    let _api_trace = crate::observability::ApiTrace::enter("store", "parse_rows");
     if text.len() > MAX_STATE_BYTES {
         return Err(invalid("mapping file exceeds 1 MiB"));
     }
@@ -283,6 +293,7 @@ fn parse_rows(text: &str, columns: usize) -> AppResult<Vec<Vec<&str>>> {
 }
 
 pub fn parse_usb(text: &str) -> AppResult<UsbMappings> {
+    let _api_trace = crate::observability::ApiTrace::enter("store", "parse_usb");
     let mut mappings = UsbMappings::new();
     let mut macs = HashSet::new();
     let mut ttys = HashSet::new();
@@ -318,6 +329,7 @@ pub fn parse_usb(text: &str) -> AppResult<UsbMappings> {
 }
 
 pub fn parse_gen5(text: &str) -> AppResult<Gen5Mappings> {
+    let _api_trace = crate::observability::ApiTrace::enter("store", "parse_gen5");
     let mut mappings = Gen5Mappings::new();
     let mut devices = HashSet::new();
 
@@ -352,6 +364,7 @@ pub fn parse_gen5(text: &str) -> AppResult<Gen5Mappings> {
 }
 
 pub fn parse_uart(text: &str) -> AppResult<UartMappings> {
+    let _api_trace = crate::observability::ApiTrace::enter("store", "parse_uart");
     let mut mappings = UartMappings::new();
     let mut ttys = HashSet::new();
 
@@ -437,6 +450,7 @@ pub fn parse_uart(text: &str) -> AppResult<UartMappings> {
 /// No sysfs access occurs here. Offline or powered-off devices must not
 /// prevent loading structurally valid persisted state.
 pub fn validate_snapshot(usb: &UsbMappings, gen5: &Gen5Mappings) -> AppResult<()> {
+    let _api_trace = crate::observability::ApiTrace::enter("store", "validate_snapshot");
     tracing::debug!(
         usb_count = usb.len(),
         gen5_count = gen5.len(),
@@ -477,6 +491,7 @@ pub fn validate_snapshot(usb: &UsbMappings, gen5: &Gen5Mappings) -> AppResult<()
 }
 
 pub fn load_mappings(usb_path: &Path, gen5_path: &Path) -> AppResult<(UsbMappings, Gen5Mappings)> {
+    let _api_trace = crate::observability::ApiTrace::enter("store", "load_mappings");
     let usb_text = read_optional_text(usb_path, MAX_STATE_BYTES)?.unwrap_or_default();
     let gen5_text = read_optional_text(gen5_path, MAX_STATE_BYTES)?.unwrap_or_default();
 
@@ -517,11 +532,13 @@ pub fn load_mappings(usb_path: &Path, gen5_path: &Path) -> AppResult<(UsbMapping
 }
 
 pub fn load_uart_mappings(path: &Path) -> AppResult<UartMappings> {
+    let _api_trace = crate::observability::ApiTrace::enter("store", "load_uart_mappings");
     let text = read_optional_text(path, MAX_STATE_BYTES)?.unwrap_or_default();
     parse_uart(&text).map_err(|error| invalid(format!("invalid {}: {error}", path.display())))
 }
 
 pub fn encode_usb(mappings: &UsbMappings) -> AppResult<String> {
+    let _api_trace = crate::observability::ApiTrace::enter("store", "encode_usb");
     let mut rows = Vec::with_capacity(mappings.len());
 
     for ((mac, serial, channel), tty) in mappings {
@@ -540,6 +557,7 @@ pub fn encode_usb(mappings: &UsbMappings) -> AppResult<String> {
 }
 
 pub fn encode_gen5(mappings: &Gen5Mappings) -> AppResult<String> {
+    let _api_trace = crate::observability::ApiTrace::enter("store", "encode_gen5");
     let mut rows = Vec::with_capacity(mappings.len());
 
     for (mac, entry) in mappings {
@@ -558,6 +576,7 @@ pub fn encode_gen5(mappings: &Gen5Mappings) -> AppResult<String> {
 }
 
 pub fn encode_uart(mappings: &UartMappings) -> AppResult<String> {
+    let _api_trace = crate::observability::ApiTrace::enter("store", "encode_uart");
     let mut rows = Vec::with_capacity(mappings.len());
 
     for (mac, mapping) in mappings {
@@ -612,6 +631,7 @@ pub fn encode_uart(mappings: &UartMappings) -> AppResult<String> {
 /// "write failed": the new data is already visible, so callers must publish
 /// the matching in-memory value. Crash durability is uncertain in that case.
 pub fn atomic_replace(path: &Path, contents: &[u8]) -> AppResult<()> {
+    let _api_trace = crate::observability::ApiTrace::enter("store", "atomic_replace");
     if contents.len() > MAX_STATE_BYTES {
         tracing::error!(path = %path.display(), size = contents.len(), "state write exceeds limit");
         return Err(invalid("state write exceeds 1 MiB"));
@@ -663,6 +683,7 @@ pub fn atomic_replace(path: &Path, contents: &[u8]) -> AppResult<()> {
 }
 
 pub fn remove_committed(path: &Path) -> AppResult<()> {
+    let _api_trace = crate::observability::ApiTrace::enter("store", "remove_committed");
     tracing::debug!(path = %path.display(), "removing persisted state file");
 
     let parent = path
@@ -708,6 +729,7 @@ mod tests {
 
     #[test]
     fn mac_parser_accepts_only_supported_complete_forms() {
+        let _api_trace = crate::observability::ApiTrace::enter("store", "mac_parser_accepts_only_supported_complete_forms");
         for value in ["AABBCCDDEEFF", "AA:BB:CC:DD:EE:FF", "AA-BB-CC-DD-EE-FF"] {
             assert_eq!(checked_mac(value).unwrap(), "aabbccddeeff");
         }
@@ -726,6 +748,7 @@ mod tests {
 
     #[test]
     fn empty_mapping_files_are_valid_but_blank_records_are_not() {
+        let _api_trace = crate::observability::ApiTrace::enter("store", "empty_mapping_files_are_valid_but_blank_records_are_not");
         assert!(parse_usb("").unwrap().is_empty());
         assert!(parse_gen5("").unwrap().is_empty());
         assert!(parse_usb("\n").is_err());
@@ -734,6 +757,7 @@ mod tests {
 
     #[test]
     fn usb_mapping_round_trip_is_canonical() {
+        let _api_trace = crate::observability::ApiTrace::enter("store", "usb_mapping_round_trip_is_canonical");
         let parsed = parse_usb("/dev/ttyUSB2,AA:BB:CC:DD:EE:FF,RELAY-A,3\r\n").unwrap();
 
         assert_eq!(
@@ -744,6 +768,7 @@ mod tests {
 
     #[test]
     fn uart_mapping_round_trip_preserves_topology_and_connection() {
+        let _api_trace = crate::observability::ApiTrace::enter("store", "uart_mapping_round_trip_preserves_topology_and_connection");
         let mapping = UartMapping {
             mac: "aabbccddeeff".into(),
             generation: 4,
@@ -769,6 +794,7 @@ mod tests {
 
     #[test]
     fn gen5_uart_mapping_records_generation_without_relay_fields() {
+        let _api_trace = crate::observability::ApiTrace::enter("store", "gen5_uart_mapping_records_generation_without_relay_fields");
         let text =
             "aabbccddeeff,5,/dev/ttyACM0,1234,abcd,-,0,/sys/devices/usb1/1-2,standalone,-,-\n";
 
@@ -786,6 +812,7 @@ mod tests {
 
     #[test]
     fn malformed_channel_never_defaults_to_zero() {
+        let _api_trace = crate::observability::ApiTrace::enter("store", "malformed_channel_never_defaults_to_zero");
         for channel in ["", "-1", "8", "03", "0x1", "one", "1tail"] {
             assert!(parse_usb(&format!("/dev/ttyUSB0,aabbccddeeff,R,{channel}\n")).is_err());
         }
@@ -793,6 +820,7 @@ mod tests {
 
     #[test]
     fn duplicates_and_shared_roles_are_rejected() {
+        let _api_trace = crate::observability::ApiTrace::enter("store", "duplicates_and_shared_roles_are_rejected");
         assert!(parse_usb(
             "/dev/ttyUSB0,aabbccddeeff,R,0\n\
              /dev/ttyUSB1,aabbccddeeff,R,1\n"
@@ -816,6 +844,7 @@ mod tests {
 
     #[test]
     fn unsafe_or_noncanonical_tty_paths_are_rejected() {
+        let _api_trace = crate::observability::ApiTrace::enter("store", "unsafe_or_noncanonical_tty_paths_are_rejected");
         for path in [
             "/tmp/ttyUSB0",
             "/dev/../dev/ttyUSB0",
@@ -830,6 +859,7 @@ mod tests {
 
     #[test]
     fn uid_is_bounded_and_not_silently_trimmed() {
+        let _api_trace = crate::observability::ApiTrace::enter("store", "uid_is_bounded_and_not_silently_trimmed");
         assert!(validate_uid("controller_123-abc.def").is_ok());
         for value in ["", " has-space", "line\nbreak", "id?admin=true"] {
             assert!(validate_uid(value).is_err());
@@ -839,6 +869,7 @@ mod tests {
 
     #[test]
     fn missing_is_optional_but_symlinks_are_rejected() {
+        let _api_trace = crate::observability::ApiTrace::enter("store", "missing_is_optional_but_symlinks_are_rejected");
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("state");
 
@@ -855,6 +886,7 @@ mod tests {
 
     #[test]
     fn oversized_and_invalid_utf8_files_are_rejected() {
+        let _api_trace = crate::observability::ApiTrace::enter("store", "oversized_and_invalid_utf8_files_are_rejected");
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("state");
 
@@ -867,6 +899,7 @@ mod tests {
 
     #[test]
     fn atomic_replacement_and_removal_round_trip() {
+        let _api_trace = crate::observability::ApiTrace::enter("store", "atomic_replacement_and_removal_round_trip");
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("uid");
 
@@ -881,6 +914,7 @@ mod tests {
 
     #[test]
     fn valid_cross_file_snapshot_does_not_require_connected_hardware() {
+        let _api_trace = crate::observability::ApiTrace::enter("store", "valid_cross_file_snapshot_does_not_require_connected_hardware");
         let usb = parse_usb("/dev/ttyUSB0,aabbccddee01,RELAY-A,0\n").unwrap();
 
         let gen5 = parse_gen5("/dev/ttyUSB2,/dev/ttyUSB3,aabbccddee02\n").unwrap();
@@ -892,6 +926,7 @@ mod tests {
 
     #[test]
     fn cross_file_device_collision_is_rejected() {
+        let _api_trace = crate::observability::ApiTrace::enter("store", "cross_file_device_collision_is_rejected");
         let usb = parse_usb("/dev/ttyUSB0,aabbccddee01,RELAY-A,0\n").unwrap();
 
         // Gen5 attempts to reuse the Gen4 console as its power interface.
@@ -902,6 +937,7 @@ mod tests {
 
     #[test]
     fn persisted_relay_mapping_does_not_require_policy_wiring() {
+        let _api_trace = crate::observability::ApiTrace::enter("store", "persisted_relay_mapping_does_not_require_policy_wiring");
         let dynamic_channel = parse_usb("/dev/ttyUSB0,aabbccddee01,RELAY-A,1\n").unwrap();
 
         let dynamic_serial = parse_usb("/dev/ttyUSB0,aabbccddee01,OTHER-RELAY,0\n").unwrap();
@@ -912,6 +948,7 @@ mod tests {
 
     #[test]
     fn persisted_relay_mapping_accepts_a_dynamically_discovered_board() {
+        let _api_trace = crate::observability::ApiTrace::enter("store", "persisted_relay_mapping_accepts_a_dynamically_discovered_board");
         let usb = parse_usb("/dev/ttyUSB0,aabbccddee99,RELAY-A,0\n").unwrap();
 
         validate_snapshot(&usb, &Gen5Mappings::new()).unwrap();
@@ -919,6 +956,7 @@ mod tests {
 
     #[test]
     fn persisted_gen5_mapping_accepts_a_dynamically_discovered_board() {
+        let _api_trace = crate::observability::ApiTrace::enter("store", "persisted_gen5_mapping_accepts_a_dynamically_discovered_board");
         let gen5 = parse_gen5("/dev/ttyUSB2,/dev/ttyUSB3,aabbccddee01\n").unwrap();
 
         validate_snapshot(&UsbMappings::new(), &gen5).unwrap();
@@ -926,6 +964,7 @@ mod tests {
 
     #[test]
     fn malformed_second_file_rejects_the_entire_load_without_rewriting_files() {
+        let _api_trace = crate::observability::ApiTrace::enter("store", "malformed_second_file_rejects_the_entire_load_without_rewriting_files");
         let directory = tempfile::tempdir().unwrap();
         let usb_path = directory.path().join("usb.csv");
         let gen5_path = directory.path().join("gen5.csv");
@@ -947,6 +986,7 @@ mod tests {
 
     #[test]
     fn missing_mapping_files_mean_uninitialized_state() {
+        let _api_trace = crate::observability::ApiTrace::enter("store", "missing_mapping_files_mean_uninitialized_state");
         let directory = tempfile::tempdir().unwrap();
 
         let (usb, gen5) = load_mappings(
@@ -961,6 +1001,7 @@ mod tests {
 
     #[test]
     fn non_regular_state_path_is_not_treated_as_missing() {
+        let _api_trace = crate::observability::ApiTrace::enter("store", "non_regular_state_path_is_not_treated_as_missing");
         let directory = tempfile::tempdir().unwrap();
         let usb_path = directory.path().join("usb.csv");
 
@@ -971,6 +1012,7 @@ mod tests {
 
     #[test]
     fn inconsistent_gen5_key_and_entry_mac_is_rejected() {
+        let _api_trace = crate::observability::ApiTrace::enter("store", "inconsistent_gen5_key_and_entry_mac_is_rejected");
         let mut mappings = Gen5Mappings::new();
 
         mappings.insert(
@@ -987,6 +1029,7 @@ mod tests {
 
     #[test]
     fn uid_file_accepts_only_one_optional_terminal_newline() {
+        let _api_trace = crate::observability::ApiTrace::enter("store", "uid_file_accepts_only_one_optional_terminal_newline");
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("uid");
 
@@ -1011,6 +1054,7 @@ mod tests {
 
     #[test]
     fn invalid_write_does_not_replace_existing_state() {
+        let _api_trace = crate::observability::ApiTrace::enter("store", "invalid_write_does_not_replace_existing_state");
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("state");
 

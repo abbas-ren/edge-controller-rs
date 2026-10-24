@@ -14,5 +14,6 @@ pub async fn uart_config_handler(
     Extension(lease): Extension<Lease>,
     Json(request): Json<super::UartConfigRequest>,
 ) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http::uart_mapping", "uart_config_handler");
     super::uart_config(State(state), Extension(lease), Json(request)).await
 }

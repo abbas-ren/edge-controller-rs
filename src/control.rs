@@ -135,6 +135,7 @@ where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
 {
+    let _api_trace = crate::observability::ApiTrace::enter("control", "deserialize_optional_option");
     Option::<T>::deserialize(deserializer).map(Some)
 }
 
@@ -142,6 +143,7 @@ static SETTINGS: OnceLock<RwLock<ControlSettings>> = OnceLock::new();
 static ACTIVE_PATHS: OnceLock<MappingPaths> = OnceLock::new();
 
 pub fn load(path: &Path) -> AppResult<Option<ControlSettings>> {
+    let _api_trace = crate::observability::ApiTrace::enter("control", "load");
     let contents = match std::fs::read(path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -162,6 +164,7 @@ pub fn load(path: &Path) -> AppResult<Option<ControlSettings>> {
 }
 
 pub fn install(mut settings: ControlSettings) -> AppResult<()> {
+    let _api_trace = crate::observability::ApiTrace::enter("control", "install");
     validate(&settings)?;
     settings.restart_pending = false;
     ACTIVE_PATHS
@@ -173,6 +176,7 @@ pub fn install(mut settings: ControlSettings) -> AppResult<()> {
 }
 
 pub fn current() -> ControlSettings {
+    let _api_trace = crate::observability::ApiTrace::enter("control", "current");
     SETTINGS
         .get()
         .map(|settings| {
@@ -185,10 +189,12 @@ pub fn current() -> ControlSettings {
 }
 
 pub fn paths() -> MappingPaths {
+    let _api_trace = crate::observability::ApiTrace::enter("control", "paths");
     ACTIVE_PATHS.get().cloned().unwrap_or_default()
 }
 
 pub fn apply(patch: ControlPatch) -> AppResult<ControlSettings> {
+    let _api_trace = crate::observability::ApiTrace::enter("control", "apply");
     let settings = SETTINGS
         .get()
         .ok_or_else(|| AppError::Msg("admin control state is not initialized".into()))?;
@@ -261,6 +267,7 @@ pub fn apply(patch: ControlPatch) -> AppResult<ControlSettings> {
 }
 
 pub fn persist(path: &Path, settings: &ControlSettings) -> AppResult<()> {
+    let _api_trace = crate::observability::ApiTrace::enter("control", "persist");
     validate(settings)?;
     let contents = serde_json::to_vec_pretty(settings)
         .map_err(|error| AppError::Msg(format!("cannot encode admin control state: {error}")))?;
@@ -268,6 +275,7 @@ pub fn persist(path: &Path, settings: &ControlSettings) -> AppResult<()> {
 }
 
 pub fn validate(settings: &ControlSettings) -> AppResult<()> {
+    let _api_trace = crate::observability::ApiTrace::enter("control", "validate");
     if settings.bind_port == 0
         || settings.metrics_port == 0
         || settings.http_port == 0
@@ -352,6 +360,7 @@ pub fn validate(settings: &ControlSettings) -> AppResult<()> {
 }
 
 fn validate_path(name: &str, path: &Path, require_writable_root: bool) -> AppResult<()> {
+    let _api_trace = crate::observability::ApiTrace::enter("control", "validate_path");
     if !path.is_absolute()
         || path
             .components()
@@ -379,6 +388,7 @@ mod tests {
 
     #[test]
     fn defaults_keep_auth_disabled_and_use_legacy_mapping_paths() {
+        let _api_trace = crate::observability::ApiTrace::enter("control", "defaults_keep_auth_disabled_and_use_legacy_mapping_paths");
         let settings = ControlSettings::default();
         assert!(!settings.auth_enabled);
         assert!(settings.api_token.is_none());
@@ -389,6 +399,7 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_raspberry_pi_models() {
+        let _api_trace = crate::observability::ApiTrace::enter("control", "rejects_unsupported_raspberry_pi_models");
         let settings = ControlSettings {
             raspberry_pi_model: 3,
             ..ControlSettings::default()
@@ -398,6 +409,7 @@ mod tests {
 
     #[test]
     fn rejects_paths_outside_service_writable_roots() {
+        let _api_trace = crate::observability::ApiTrace::enter("control", "rejects_paths_outside_service_writable_roots");
         let mut settings = ControlSettings::default();
         settings.paths.usb = PathBuf::from("/home/user/mapping.csv");
         assert!(validate(&settings).is_err());
@@ -405,6 +417,7 @@ mod tests {
 
     #[test]
     fn authentication_requires_a_strong_explicit_token() {
+        let _api_trace = crate::observability::ApiTrace::enter("control", "authentication_requires_a_strong_explicit_token");
         let mut settings = ControlSettings {
             auth_enabled: true,
             api_token: Some("short".into()),
@@ -417,6 +430,7 @@ mod tests {
 
     #[test]
     fn control_patch_distinguishes_omitted_and_cleared_optional_values() {
+        let _api_trace = crate::observability::ApiTrace::enter("control", "control_patch_distinguishes_omitted_and_cleared_optional_values");
         let omitted = serde_json::from_value::<ControlPatch>(serde_json::json!({})).unwrap();
         assert_eq!(omitted.relay_serial_number, None);
         assert_eq!(omitted.relay_vid_pid, None);

@@ -16,6 +16,7 @@ use std::{
 
 /// Open an 8-N-1 serial console with bounded read timeouts.
 pub fn open_uart(path: &str, baud: u32) -> AppResult<Box<dyn SerialPort>> {
+    let _api_trace = crate::observability::ApiTrace::enter("uart", "open_uart");
     serialport::new(path, baud)
         .data_bits(serialport::DataBits::Eight)
         .parity(serialport::Parity::None)
@@ -36,6 +37,7 @@ pub fn open_uart(path: &str, baud: u32) -> AppResult<Box<dyn SerialPort>> {
 /// Existing terminal settings are preserved because the supplied sources
 /// do not specify the power-controller baud rate.
 pub fn write_to_path(path: &str, text: &str) -> AppResult<()> {
+    let _api_trace = crate::observability::ApiTrace::enter("uart", "write_to_path");
     let mut file = OpenOptions::new().write(true).open(path)?;
     file.write_all(text.as_bytes())?;
     Ok(())
@@ -50,6 +52,7 @@ pub struct Console {
 
 impl Console {
     pub fn open(path: &str, baud: u32, uart_log_prefix: Option<&str>) -> AppResult<Self> {
+        let _api_trace = crate::observability::ApiTrace::enter("uart", "open");
         let port = open_uart(path, baud)?;
 
         let uart_log = uart_log_prefix
@@ -75,6 +78,7 @@ impl Console {
     }
 
     pub fn write_uart_log(&mut self, bytes: &[u8]) -> AppResult<()> {
+        let _api_trace = crate::observability::ApiTrace::enter("uart", "write_uart_log");
         if let Some(log) = &mut self.uart_log {
             log.write_all(bytes)?;
             log.flush()?;
@@ -83,6 +87,7 @@ impl Console {
     }
 
     pub fn clear_input(&mut self) -> AppResult<()> {
+        let _api_trace = crate::observability::ApiTrace::enter("uart", "clear_input");
         self.port
             .clear(serialport::ClearBuffer::Input)
             .map_err(|error| AppError::Msg(format!("clearing UART input failed: {error}")))?;
@@ -92,6 +97,7 @@ impl Console {
     }
 
     pub fn send(&mut self, bytes: &[u8]) -> AppResult<()> {
+        let _api_trace = crate::observability::ApiTrace::enter("uart", "send");
         if let Err(err) = self.port.write_all(bytes) {
             error!("UART write failed: {err}");
             self.write_uart_log(format!("UART write failed: {err}").as_bytes())?;
@@ -106,6 +112,7 @@ impl Console {
     }
 
     pub fn command(&mut self, command: &str) -> AppResult<()> {
+        let _api_trace = crate::observability::ApiTrace::enter("uart", "command");
         self.write_uart_log(format!("UART command: {command}").as_bytes())?;
         self.send(command.as_bytes())?;
 
@@ -115,6 +122,7 @@ impl Console {
     }
 
     pub fn wait(&mut self, expected: &[u8], timeout: Duration) -> AppResult<()> {
+        let _api_trace = crate::observability::ApiTrace::enter("uart", "wait");
         self.wait_any(&[expected], timeout).map(|_| ())
     }
 
@@ -123,6 +131,7 @@ impl Console {
     /// Returns the index in `patterns`. If matches begin at the same byte,
     /// the first listed pattern wins.
     pub fn wait_any(&mut self, patterns: &[&[u8]], timeout: Duration) -> AppResult<usize> {
+        let _api_trace = crate::observability::ApiTrace::enter("uart", "wait_any");
         if patterns.is_empty()
             || patterns
                 .iter()
@@ -212,6 +221,7 @@ impl Console {
     /// Removing this pacing without validating the receiver can overrun
     /// its serial input buffer.
     pub fn send_srec(&mut self, path: &Path) -> AppResult<()> {
+        let _api_trace = crate::observability::ApiTrace::enter("uart", "send_srec");
         use std::io::Read;
 
         let mut reader = BufReader::new(File::open(path)?);
@@ -275,6 +285,7 @@ mod tests {
 
     #[test]
     fn raw_write_preserves_protocol_bytes() {
+        let _api_trace = crate::observability::ApiTrace::enter("uart", "raw_write_preserves_protocol_bytes");
         let file = tempfile::NamedTempFile::new().unwrap();
         write_to_path(file.path().to_str().unwrap(), "POWER#ON\n").unwrap();
         assert_eq!(fs::read(file.path()).unwrap(), b"POWER#ON\n");
@@ -282,6 +293,7 @@ mod tests {
 
     #[test]
     fn raw_write_reports_missing_device() {
+        let _api_trace = crate::observability::ApiTrace::enter("uart", "raw_write_reports_missing_device");
         let directory = tempfile::tempdir().unwrap();
         let missing = directory.path().join("missing-device");
         assert!(write_to_path(missing.to_str().unwrap(), "POWER#OFF\n").is_err());

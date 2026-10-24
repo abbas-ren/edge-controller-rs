@@ -13,6 +13,7 @@ use crate::{config, models, observability::metrics::global_metrics, state::AppSt
 /// For a Raspberry Pi, prefer `DEV_CONTROLLER_INTERFACE=eth0` or `wlan0` over
 /// the legacy default. This keeps the service portable across host layouts.
 pub fn interface_identity(interface: &str) -> Result<(String, String)> {
+    let _api_trace = crate::observability::ApiTrace::enter("runtime", "interface_identity");
     if interface.is_empty()
         || !interface
             .bytes()
@@ -43,6 +44,7 @@ const REGISTRATION_RETRY_MAX: Duration = Duration::from_secs(60);
 /// Only one registration task may run per process. That task remains active
 /// until the backend accepts the controller or service shutdown begins.
 pub async fn registration_loop(state: Arc<AppState>, inventory: Vec<models::RelayInventory>) {
+    let _api_trace = crate::observability::ApiTrace::enter("runtime", "registration_loop");
     registration_loop_with_delay(state, inventory, REGISTRATION_RETRY_INITIAL).await;
 }
 
@@ -51,6 +53,7 @@ async fn registration_loop_with_delay(
     inventory: Vec<models::RelayInventory>,
     initial_delay: Duration,
 ) {
+    let _api_trace = crate::observability::ApiTrace::enter("runtime", "registration_loop_with_delay");
     let url = format!(
         "http://{}:{}/api/v1/device/controller/",
         state.cfg.server_ip, state.cfg.http_port
@@ -105,6 +108,7 @@ async fn registration_loop_with_delay(
 /// Serial reads use a short timeout, allowing workers to observe the stop flag
 /// without terminating threads or closing descriptors from elsewhere.
 pub async fn stop_captures(state: &AppState) {
+    let _api_trace = crate::observability::ApiTrace::enter("runtime", "stop_captures");
     let sessions = {
         let mut active = state.rtos_sessions.lock().await;
 
@@ -146,6 +150,7 @@ pub fn check_offline(
     authentication_enabled: bool,
     mapping_paths: &crate::control::MappingPaths,
 ) -> Result<()> {
+    let _api_trace = crate::observability::ApiTrace::enter("runtime", "check_offline");
     cfg.validate().context("validating service configuration")?;
 
     for filename in [
@@ -225,6 +230,7 @@ mod tests {
 
     #[test]
     fn offline_check_uses_selected_mapping_paths() {
+        let _api_trace = crate::observability::ApiTrace::enter("runtime", "offline_check_uses_selected_mapping_paths");
         let directory = tempfile::tempdir().unwrap();
         let mapping_paths = MappingPaths {
             uid: directory.path().join("controller.uid"),
@@ -249,6 +255,7 @@ mod tests {
 
     #[test]
     fn invalid_interface_names_are_rejected() {
+        let _api_trace = crate::observability::ApiTrace::enter("runtime", "invalid_interface_names_are_rejected");
         for value in ["", "..", "not/valid", "bad name"] {
             assert!(
                 interface_identity(value).is_err(),
@@ -259,6 +266,7 @@ mod tests {
 
     #[tokio::test]
     async fn registration_retries_until_backend_accepts_request() {
+        let _api_trace = crate::observability::ApiTrace::enter("runtime", "registration_retries_until_backend_accepts_request");
         let attempts = Arc::new(AtomicUsize::new(0));
         let handler_attempts = attempts.clone();
         let app = Router::new().route(

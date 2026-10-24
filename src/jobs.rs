@@ -41,6 +41,7 @@ impl Default for Jobs {
 impl Jobs {
     /// Fail immediately instead of accumulating an unbounded work queue.
     pub fn try_enter(&self) -> Result<Lease, &'static str> {
+        let _api_trace = crate::observability::ApiTrace::enter("jobs", "try_enter");
         self.gate
             .clone()
             .try_acquire_owned()
@@ -58,6 +59,7 @@ impl Jobs {
     }
 
     pub fn is_closing(&self) -> bool {
+        let _api_trace = crate::observability::ApiTrace::enter("jobs", "is_closing");
         self.gate.is_closed()
     }
 
@@ -69,6 +71,7 @@ impl Jobs {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        let _api_trace = crate::observability::ApiTrace::enter("jobs", "spawn");
         self.tracker.spawn(async move {
             let _lease = lease;
             future.await;
@@ -76,11 +79,13 @@ impl Jobs {
     }
 
     pub fn begin_shutdown(&self) {
+        let _api_trace = crate::observability::ApiTrace::enter("jobs", "begin_shutdown");
         self.gate.close();
     }
 
     /// Call only after HTTP handlers have drained, so none can add jobs.
     pub async fn wait(&self) {
+        let _api_trace = crate::observability::ApiTrace::enter("jobs", "wait");
         self.tracker.close();
         self.tracker.wait().await;
     }
@@ -92,6 +97,7 @@ mod tests {
 
     #[test]
     fn hardware_operations_are_serialized_until_lease_is_released() {
+        let _api_trace = crate::observability::ApiTrace::enter("jobs", "hardware_operations_are_serialized_until_lease_is_released");
         let jobs = Jobs::default();
         let lease = jobs
             .try_enter()
@@ -108,6 +114,7 @@ mod tests {
 
     #[test]
     fn shutdown_rejects_new_hardware_operations() {
+        let _api_trace = crate::observability::ApiTrace::enter("jobs", "shutdown_rejects_new_hardware_operations");
         let jobs = Jobs::default();
         jobs.begin_shutdown();
 

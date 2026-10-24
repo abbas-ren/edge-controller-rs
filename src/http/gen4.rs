@@ -15,6 +15,7 @@ pub async fn ipl_run_handler(
     Extension(lease): Extension<Lease>,
     Json(request): Json<super::IplRequest>,
 ) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http::gen4", "ipl_run_handler");
     super::ipl_run(State(state), Extension(lease), Json(request)).await
 }
 
@@ -24,6 +25,7 @@ pub async fn ipl_mode_handler(
     Extension(lease): Extension<Lease>,
     Json(request): Json<super::IplModeRequest>,
 ) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http::gen4", "ipl_mode_handler");
     super::ipl_mode(State(state), Extension(lease), Json(request)).await
 }
 
@@ -33,6 +35,7 @@ pub async fn ipl_mode_default_handler(
     Extension(lease): Extension<Lease>,
     Json(request): Json<super::IplModeRequest>,
 ) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http::gen4", "ipl_mode_default_handler");
     super::ipl_mode_default(State(state), Extension(lease), Json(request)).await
 }
 
@@ -42,6 +45,7 @@ pub async fn reboot_device_handler(
     Extension(lease): Extension<Lease>,
     Json(request): Json<super::RebootDeviceRequest>,
 ) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http::gen4", "reboot_device_handler");
     super::reboot_device(State(state), Extension(lease), Json(request)).await
 }
 
@@ -50,5 +54,6 @@ pub async fn ipl_remove_handler(
     State(state): State<Arc<AppState>>,
     Json(request): Json<super::RemoveIplRequest>,
 ) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http::gen4", "ipl_remove_handler");
     super::ipl_remove(State(state), Json(request)).await
 }

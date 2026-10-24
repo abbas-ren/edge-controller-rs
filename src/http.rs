@@ -55,11 +55,13 @@ const MAX_CAPTURE_BYTES: u64 = 64 * 1024 * 1024;
 static MAPPING_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn persist_uart_mappings(mappings: &UartMappings) -> crate::error::AppResult<()> {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "persist_uart_mappings");
     let contents = crate::store::encode_uart(mappings)?;
     crate::store::atomic_replace(&crate::control::paths().uart, contents.as_bytes())
 }
 
 fn parse_vid_pid(value: &str) -> crate::error::AppResult<(u16, u16)> {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "parse_vid_pid");
     let Some((vid, pid)) = value.split_once(':') else {
         return Err(crate::error::AppError::Msg(
             "UART VID:PID must use the form 1234:abcd".into(),
@@ -89,6 +91,7 @@ fn disconnected_uart(
     pid: u16,
     expected_tty: Option<&str>,
 ) -> crate::error::AppResult<Option<UsbTty>> {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "disconnected_uart");
     let current_topologies = current
         .iter()
         .filter(|device| device.vid == vid && device.pid == pid)
@@ -116,6 +119,7 @@ fn disconnected_uart(
 }
 
 fn connection_type(topology: &Path) -> crate::error::AppResult<String> {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "connection_type");
     let name = topology
         .file_name()
         .and_then(|name| name.to_str())
@@ -134,6 +138,7 @@ fn wait_for_uart_disconnect(
     pid: u16,
     expected_tty: Option<&str>,
 ) -> crate::error::AppResult<UsbTty> {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "wait_for_uart_disconnect");
     for _ in 0..60 {
         let current = crate::usb::inventory()?;
         if let Some(device) = disconnected_uart(before, &current, vid, pid, expected_tty)? {
@@ -151,6 +156,7 @@ fn wait_for_uart_reconnect(
     vid: u16,
     pid: u16,
 ) -> crate::error::AppResult<UsbTty> {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "wait_for_uart_reconnect");
     for _ in 0..60 {
         let mut matches = crate::usb::inventory()?
             .into_iter()
@@ -183,6 +189,7 @@ enum UartPowerControl {
 
 impl UartPowerControl {
     fn set(&self, state: &AppState, on: bool) -> crate::error::AppResult<()> {
+        let _api_trace = crate::observability::ApiTrace::enter("http", "set");
         match self {
             Self::Relay { serial, channel } => state.relay.set_channel(serial, *channel, on),
             Self::Gen5 { power_tty } => {
@@ -199,6 +206,7 @@ fn strict_uart_power_cycle(
     pid: u16,
     expected_tty: Option<&str>,
 ) -> crate::error::AppResult<UsbTty> {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "strict_uart_power_cycle");
     let before = crate::usb::inventory()?;
     let expected_count = before
         .iter()
@@ -230,6 +238,7 @@ fn configure_uart_sync(
     state: Arc<AppState>,
     request: UartConfigRequest,
 ) -> crate::error::AppResult<UartConfigResponse> {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "configure_uart_sync");
     let mac = validated_mac(&request.mac)?;
     let (vid, pid) = parse_vid_pid(&request.vid_pid)?;
 
@@ -340,6 +349,7 @@ async fn uart_config(
     Extension(lease): Extension<Lease>,
     Json(request): Json<UartConfigRequest>,
 ) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "uart_config");
     info!(handler = "uart_config", "API handler invoked");
     let result = task::spawn_blocking(move || {
         let _lease = lease;
@@ -361,6 +371,7 @@ async fn uart_config(
 /// Token length is not secret. This avoids an obvious byte-by-byte timing
 /// leak without introducing an additional authentication dependency.
 fn token_matches(expected: &[u8], supplied: &[u8]) -> bool {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "token_matches");
     if expected.len() != supplied.len() {
         debug!(
             expected_len = expected.len(),
@@ -386,6 +397,7 @@ fn token_matches(expected: &[u8], supplied: &[u8]) -> bool {
 }
 
 fn is_hardware_operation(path: &str) -> bool {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "is_hardware_operation");
     matches!(
         path,
         "/relay"
@@ -413,6 +425,7 @@ async fn request_guard(
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "request_guard");
     let method = request.method().clone();
     let metric_route = request
         .extensions()
@@ -440,6 +453,7 @@ async fn request_guard(
 }
 
 async fn guarded_request(state: Arc<AppState>, mut request: Request<Body>, next: Next) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "guarded_request");
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
     let content_type = request
@@ -588,6 +602,7 @@ async fn guarded_request(state: Arc<AppState>, mut request: Request<Body>, next:
 }
 
 fn mapping_guard() -> crate::error::AppResult<std::sync::MutexGuard<'static, ()>> {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "mapping_guard");
     MAPPING_LOCK.lock().map_err(|error| {
         tracing::error!(%error, "mapping operation mutex was poisoned");
         crate::error::AppError::Msg("mapping operation mutex was poisoned".into())
@@ -599,6 +614,7 @@ fn mapping_guard() -> crate::error::AppResult<std::sync::MutexGuard<'static, ()>
 /// We deliberately reject CSV delimiters instead of introducing quoting
 /// that the original project's CSV readers would not understand.
 fn validate_csv_field(name: &str, value: &str) -> crate::error::AppResult<()> {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "validate_csv_field");
     if value.is_empty()
         || value.len() > 255
         || value.contains(',')
@@ -623,6 +639,7 @@ fn validate_csv_field(name: &str, value: &str) -> crate::error::AppResult<()> {
 
 /// Call only from blocking workers while holding MAPPING_LOCK.
 fn persist_usb_mappings(state: &AppState, mappings: &UsbMappings) -> crate::error::AppResult<()> {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "persist_usb_mappings");
     let other = state.gen5_map.blocking_read();
 
     tracing::debug!(
@@ -643,6 +660,7 @@ fn persist_usb_mappings(state: &AppState, mappings: &UsbMappings) -> crate::erro
 
 /// Call only from blocking workers while holding MAPPING_LOCK.
 fn persist_gen5_mappings(state: &AppState, mappings: &Gen5Mappings) -> crate::error::AppResult<()> {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "persist_gen5_mappings");
     let other = state.usb_map.blocking_read();
 
     tracing::debug!(
@@ -679,6 +697,7 @@ fn probe_with_power<F>(
 where
     F: FnMut(bool) -> crate::error::AppResult<()>,
 {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "probe_with_power");
     use crate::error::AppError;
 
     tracing::debug!(
@@ -737,6 +756,7 @@ fn probe_uart_candidates<F>(
 where
     F: FnMut(bool) -> crate::error::AppResult<()>,
 {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "probe_uart_candidates");
     use crate::error::AppError;
 
     let observation = (|| {
@@ -795,6 +815,7 @@ fn eligible_uart_candidates(
     used_paths: &std::collections::HashSet<String>,
     relay_identity: &crate::relay::RelayIdentity,
 ) -> Vec<crate::usb::UsbTty> {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "eligible_uart_candidates");
     devices
         .into_iter()
         .filter(|device| {
@@ -817,6 +838,7 @@ fn map_usb_to_mac_sync(
     channel: u8,
     generation: Generation,
 ) -> crate::error::AppResult<bool> {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "map_usb_to_mac_sync");
     use crate::error::AppError;
 
     let mac = validated_mac(&mac)?;
@@ -964,6 +986,7 @@ fn map_usb_to_mac_sync(
 /// Configure the power-controller serial settings during deployment if
 /// its firmware requires settings different from the device defaults.
 fn probe_gen5_pair(uart: &str, power: &str) -> crate::error::AppResult<Option<String>> {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "probe_gen5_pair");
     let uart = checked_tty(uart)?;
     let power = checked_tty(power)?;
 
@@ -990,6 +1013,7 @@ fn resolve_gen5_mapping_sync(
     state: Arc<AppState>,
     mac: &str,
 ) -> crate::error::AppResult<Option<(String, String)>> {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "resolve_gen5_mapping_sync");
     use crate::error::AppError;
 
     tracing::debug!(target_mac = %mac, "starting Gen5 mapping resolution");
@@ -1077,11 +1101,13 @@ fn resolve_gen5_mapping_sync(
 }
 
 async fn health_handler() -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "health_handler");
     debug!("service health endpoint invoked");
     ok().into_response()
 }
 
 fn readiness_status(uid_present: bool, shutting_down: bool) -> StatusCode {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "readiness_status");
     if uid_present && !shutting_down {
         StatusCode::OK
     } else {
@@ -1090,6 +1116,7 @@ fn readiness_status(uid_present: bool, shutting_down: bool) -> StatusCode {
 }
 
 async fn readiness_handler(State(state): State<Arc<AppState>>) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "readiness_handler");
     let registered = state.controller.read().await.uid.is_some();
     let shutting_down = state.jobs.is_closing();
     let status = readiness_status(registered, shutting_down);
@@ -1106,6 +1133,7 @@ async fn readiness_handler(State(state): State<Arc<AppState>>) -> Response {
 }
 
 async fn status_handler(State(state): State<Arc<AppState>>) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "status_handler");
     let (board_mac, board_ip, uid) = {
         let controller = state.controller.read().await;
         (
@@ -1140,6 +1168,7 @@ async fn status_handler(State(state): State<Arc<AppState>>) -> Response {
 }
 
 async fn metrics_handler() -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "metrics_handler");
     let output = global_metrics().render();
     (
         StatusCode::OK,
@@ -1163,6 +1192,7 @@ struct RuntimeLogLevelRequest {
 }
 
 async fn runtime_logs_handler(Query(query): Query<RuntimeLogsQuery>) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "runtime_logs_handler");
     let level = match crate::logging::current_level() {
         Ok(level) => level,
         Err(error) => return error_response(error.to_string(), StatusCode::SERVICE_UNAVAILABLE),
@@ -1175,6 +1205,7 @@ async fn runtime_logs_handler(Query(query): Query<RuntimeLogsQuery>) -> Response
 }
 
 async fn runtime_log_level_handler(Json(request): Json<RuntimeLogLevelRequest>) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "runtime_log_level_handler");
     match crate::logging::set_level(&request.level) {
         Ok(level) => {
             info!(%level, "runtime log level updated");
@@ -1185,18 +1216,21 @@ async fn runtime_log_level_handler(Json(request): Json<RuntimeLogLevelRequest>) 
 }
 
 fn ok() -> Json<serde_json::Value> {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "ok");
     debug!("generic success response generated");
     Json(serde_json::json!({"OK": true}))
 }
 
 fn err_json(msg: &str, code: StatusCode) -> (StatusCode, Json<serde_json::Value>) {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "err_json");
     debug!(status = %code, error = %msg, "error JSON response created");
     (code, Json(serde_json::json!({ "error": msg })))
 }
 
 fn error_response(message: impl AsRef<str>, status: StatusCode) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "error_response");
     let message = message.as_ref();
-    warn!(status = %status, error = %message, "API request failed and returned an error response");
+    crate::observability::api_fail("error_response", status.as_u16(), message);
     (
         status,
         Json(serde_json::json!({
@@ -1209,11 +1243,13 @@ fn error_response(message: impl AsRef<str>, status: StatusCode) -> Response {
 macro_rules! log_handler_request {
     ($handler:literal, $request:expr) => {
         let _ = &$request;
+        // Enter/exit for the handler fn is provided by ApiTrace at function scope.
         info!(handler = $handler, "API handler invoked");
     };
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "router");
     let mut router = Router::new()
         .route("/health", get(health_handler))
         .route("/ready", get(readiness_handler))
@@ -1273,6 +1309,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 }
 
 fn required<T>(value: Option<T>, field: &str) -> crate::error::AppResult<T> {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "required");
     value.ok_or_else(|| {
         warn!(field = %field, "required request value missing");
         crate::error::AppError::Msg(format!("{field} is required"))
@@ -1293,6 +1330,7 @@ async fn flashwriter_target(
     state: &AppState,
     request: FlashWriterTargetRequest,
 ) -> crate::error::AppResult<ipl::FlashWriterTarget> {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "flashwriter_target");
     let FlashWriterTargetRequest {
         generation,
         mac,
@@ -1351,6 +1389,7 @@ async fn prepare_flash(
     state: &AppState,
     request: IplRequest,
 ) -> crate::error::AppResult<PreparedFlash> {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "prepare_flash");
     let mac = validated_mac(&required(request.mac, "mac")?)?;
     let path = required(request.path, "path")?;
 
@@ -1462,6 +1501,7 @@ async fn ipl_run(
     Extension(lease): Extension<Lease>,
     Json(request): Json<IplRequest>,
 ) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "ipl_run");
     log_handler_request!("ipl_run", &request);
 
     let prepared = match prepare_flash(&state, request).await {
@@ -1504,6 +1544,7 @@ async fn execute_ipl_mode(
     request: IplModeRequest,
     download: bool,
 ) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "execute_ipl_mode");
     let generation = state.cfg.gen.as_int();
     let target = match flashwriter_target(
         &state,
@@ -1549,6 +1590,7 @@ async fn ipl_mode(
     Extension(lease): Extension<Lease>,
     Json(request): Json<IplModeRequest>,
 ) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "ipl_mode");
     log_handler_request!("ipl_mode", &request);
     execute_ipl_mode(state, lease, request, true).await
 }
@@ -1558,6 +1600,7 @@ async fn ipl_mode_default(
     Extension(lease): Extension<Lease>,
     Json(request): Json<IplModeRequest>,
 ) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "ipl_mode_default");
     log_handler_request!("ipl_mode_default", &request);
     execute_ipl_mode(state, lease, request, false).await
 }
@@ -1572,6 +1615,7 @@ async fn reboot_device(
     Extension(lease): Extension<Lease>,
     Json(request): Json<RebootDeviceRequest>,
 ) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "reboot_device");
     log_handler_request!("reboot_device", &request);
 
     let power = match mapped_power_tty(&state, &request.power).await {
@@ -1615,6 +1659,7 @@ async fn confirmation(
     State(state): State<Arc<AppState>>,
     Json(request): Json<ConfirmationRequest>,
 ) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "confirmation");
     log_handler_request!("confirmation", &request);
 
     if let Err(error) = crate::store::validate_uid(&request.controller_id) {
@@ -1641,6 +1686,7 @@ fn delete_mappings_sync(
     serial: Option<String>,
     channel: Option<u8>,
 ) -> crate::error::AppResult<()> {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "delete_mappings_sync");
     use crate::error::AppError;
 
     let mac = mac.as_deref().map(validated_mac).transpose()?;
@@ -1698,6 +1744,7 @@ async fn devcon_delete(
     State(state): State<Arc<AppState>>,
     Json(request): Json<DeleteRequest>,
 ) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "devcon_delete");
     log_handler_request!("devcon_delete", &request);
 
     let Some(generation) = Generation::from_int(request.gen) else {
@@ -1770,6 +1817,7 @@ async fn relay_delete(
     State(state): State<Arc<AppState>>,
     Json(request): Json<DeleteRequest>,
 ) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "relay_delete");
     log_handler_request!("relay_delete", &request);
 
     let Some(generation @ (Generation::Gen3 | Generation::Gen4)) =
@@ -1814,6 +1862,7 @@ async fn gen5_tty_entry(
     State(state): State<Arc<AppState>>,
     Json(req): Json<Gen5TtyRequest>,
 ) -> impl IntoResponse {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "gen5_tty_entry");
     log_handler_request!("gen5_tty_entry", &req);
 
     match resolve_gen5_mapping_sync(state.clone(), &req.mac) {
@@ -1840,6 +1889,7 @@ async fn relay(
     Extension(lease): Extension<Lease>,
     Json(request): Json<RelayRequest>,
 ) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "relay");
     log_handler_request!("relay", &request);
 
     if request.channel > 7 {
@@ -1884,6 +1934,7 @@ async fn relay_status(
     Extension(lease): Extension<Lease>,
     Json(request): Json<RelayStatusRequest>,
 ) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "relay_status");
     log_handler_request!("relay_status", &request);
 
     if request.channel > 7 {
@@ -1921,6 +1972,7 @@ async fn relay_identity(
     Extension(lease): Extension<Lease>,
     Json(request): Json<RelayIdentityUpdateRequest>,
 ) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "relay_identity");
     log_handler_request!("relay_identity", &request);
 
     if request.vid_pid.trim().is_empty() {
@@ -1973,6 +2025,7 @@ async fn relay_config(
     State(state): State<Arc<AppState>>,
     Json(request): Json<RelayConfigRequest>,
 ) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "relay_config");
     log_handler_request!("relay_config", &request);
 
     let Some(generation) = Generation::from_int(request.gen) else {
@@ -2058,6 +2111,7 @@ async fn gen5_power(
     Extension(lease): Extension<Lease>,
     Json(request): Json<Gen5PowerRequest>,
 ) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "gen5_power");
     log_handler_request!("gen5_power", &request);
 
     let on = match parse_power_state(&request.state) {
@@ -2098,6 +2152,7 @@ async fn mapping_entry(
     State(_state): State<Arc<AppState>>,
     Json(request): Json<MappingEntryRequest>,
 ) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "mapping_entry");
     log_handler_request!("mapping_entry", &request);
 
     if request.gen != 5 {
@@ -2131,6 +2186,7 @@ async fn ipl_remove(
     State(_state): State<Arc<AppState>>,
     Json(request): Json<RemoveIplRequest>,
 ) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "ipl_remove");
     log_handler_request!("ipl_remove", &request);
 
     let result = task::spawn_blocking(move || -> crate::error::AppResult<()> {
@@ -2181,6 +2237,7 @@ async fn ipl_remove(
 ///
 /// Exact comparison avoids accepting a prefix of another device's MAC.
 fn validated_mac(value: &str) -> crate::error::AppResult<String> {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "validated_mac");
     let result = crate::store::checked_mac(value);
     if let Err(error) = &result {
         warn!(mac = %value, %error, "MAC validation failed");
@@ -2196,6 +2253,7 @@ fn validated_mac(value: &str) -> crate::error::AppResult<String> {
 /// This is a device-type check, not authorization. A production deployment
 /// should additionally allowlist the expected device identities.
 fn checked_tty(value: &str) -> crate::error::AppResult<String> {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "checked_tty");
     use std::os::unix::fs::FileTypeExt;
 
     let path = match fs::canonicalize(value) {
@@ -2249,6 +2307,7 @@ async fn resolve_rtos_tty(
     channel: Option<u8>,
     explicit_tty: Option<&str>,
 ) -> crate::error::AppResult<String> {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "resolve_rtos_tty");
     use crate::error::AppError;
 
     let mac = validated_mac(mac.ok_or_else(|| AppError::Msg("mac is required".into()))?)?;
@@ -2293,6 +2352,7 @@ async fn rtos_start(
     State(state): State<Arc<AppState>>,
     Json(request): Json<RtosStartRequest>,
 ) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "rtos_start");
     log_handler_request!("rtos_start", &request);
 
     let session_key = match request.mac.as_deref().map(validated_mac).transpose() {
@@ -2431,6 +2491,7 @@ async fn rtos_end(
     State(state): State<Arc<AppState>>,
     Json(request): Json<RtosEndRequest>,
 ) -> Response {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "rtos_end");
     log_handler_request!("rtos_end", &request);
 
     let session_key = match request.mac.as_deref().map(validated_mac).transpose() {
@@ -2508,6 +2569,7 @@ async fn notify_relay_config(
     mac: &str,
     success: bool,
 ) -> Result<(), reqwest::Error> {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "notify_relay_config");
     let url = format!(
         "http://{}:{}/api/v1/device/relay/config/confirmation",
         state.cfg.server_ip, state.cfg.http_port,
@@ -2541,6 +2603,7 @@ async fn notify_gen5_mapping(
     mac: &str,
     mapping: Option<&serde_json::Value>,
 ) -> Result<(), reqwest::Error> {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "notify_gen5_mapping");
     let ip = state.controller.read().await.board_ip.clone();
 
     let mut payload = serde_json::json!({
@@ -2579,9 +2642,11 @@ fn read_uboot_mac(
     port: &mut dyn serialport::SerialPort,
     timeout: Duration,
 ) -> crate::error::AppResult<Option<String>> {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "read_uboot_mac");
     use std::time::Instant;
 
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        let _api_trace = crate::observability::ApiTrace::enter("http", "contains");
         haystack.windows(needle.len()).any(|part| part == needle)
     }
 
@@ -2673,6 +2738,7 @@ fn read_uboot_mac(
 /// next UART read. A complete but malformed value is an error rather than
 /// a partial or prefix match.
 fn extract_uboot_mac(response: &[u8]) -> crate::error::AppResult<Option<String>> {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "extract_uboot_mac");
     use crate::error::AppError;
 
     for terminated_line in response.split_inclusive(|byte| *byte == b'\r' || *byte == b'\n') {
@@ -2702,6 +2768,7 @@ fn extract_uboot_mac(response: &[u8]) -> crate::error::AppResult<Option<String>>
 }
 
 fn parse_power_state(value: &str) -> crate::error::AppResult<bool> {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "parse_power_state");
     if value.eq_ignore_ascii_case("on") {
         debug!(state = %value, parsed = true, "power state parsed as ON");
         Ok(true)
@@ -2724,6 +2791,7 @@ fn parse_power_state(value: &str) -> crate::error::AppResult<bool> {
 /// Stored ttyUSB names can become stale after hotplug; re-run mapping after
 /// USB topology changes.
 async fn mapped_power_tty(state: &AppState, supplied: &str) -> crate::error::AppResult<String> {
+    let _api_trace = crate::observability::ApiTrace::enter("http", "mapped_power_tty");
     let supplied = checked_tty(supplied)?;
     tracing::debug!(supplied_tty = %supplied, "validating supplied Gen5 power TTY");
     let entries: Vec<String> = state
@@ -2773,6 +2841,7 @@ mod tests {
 
     #[test]
     fn dynamic_uart_candidates_exclude_assigned_paths_and_the_active_relay() {
+        let _api_trace = crate::observability::ApiTrace::enter("http", "dynamic_uart_candidates_exclude_assigned_paths_and_the_active_relay");
         let devices = vec![
             crate::usb::UsbTty {
                 tty: "/dev/ttyUSB0".into(),
@@ -2814,6 +2883,7 @@ mod tests {
 
     #[test]
     fn strict_uart_resolution_selects_only_the_disconnected_requested_topology() {
+        let _api_trace = crate::observability::ApiTrace::enter("http", "strict_uart_resolution_selects_only_the_disconnected_requested_topology");
         let requested = crate::usb::UsbTty {
             tty: "/dev/ttyUSB0".into(),
             vid: 0x0403,
@@ -2845,6 +2915,7 @@ mod tests {
     }
 
     fn test_state(features: FeatureFlags, generation: Generation) -> Arc<AppState> {
+        let _api_trace = crate::observability::ApiTrace::enter("http", "test_state");
         Arc::new(AppState {
             cfg: AppConfig {
                 server_ip: "127.0.0.1".into(),
@@ -2877,6 +2948,7 @@ mod tests {
         features: FeatureFlags,
         generation: Generation,
     ) -> (String, tokio::task::JoinHandle<()>) {
+        let _api_trace = crate::observability::ApiTrace::enter("http", "test_server");
         test_server_with_token(features, generation, None).await
     }
 
@@ -2885,6 +2957,7 @@ mod tests {
         generation: Generation,
         api_token: Option<&str>,
     ) -> (String, tokio::task::JoinHandle<()>) {
+        let _api_trace = crate::observability::ApiTrace::enter("http", "test_server_with_token");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let state = test_state(features, generation);
@@ -2896,6 +2969,7 @@ mod tests {
 
     #[test]
     fn normalizes_supported_mac_formats() {
+        let _api_trace = crate::observability::ApiTrace::enter("http", "normalizes_supported_mac_formats");
         for input in ["AA:BB:CC:DD:EE:FF", "AA-BB-CC-DD-EE-FF", "aabbccddeeff"] {
             assert_eq!(validated_mac(input).unwrap(), "aabbccddeeff");
         }
@@ -2903,6 +2977,7 @@ mod tests {
 
     #[test]
     fn rejects_short_long_and_non_hex_addresses() {
+        let _api_trace = crate::observability::ApiTrace::enter("http", "rejects_short_long_and_non_hex_addresses");
         for input in ["", "aa:bb:cc", "aa:bb:cc:dd:ee:ff:00", "aa:bb:cc:dd:ee:gg"] {
             assert!(validated_mac(input).is_err());
         }
@@ -2910,6 +2985,7 @@ mod tests {
 
     #[test]
     fn extracts_complete_environment_response() {
+        let _api_trace = crate::observability::ApiTrace::enter("http", "extracts_complete_environment_response");
         let response = b"printenv ethaddr\r\nethaddr=AA:BB:CC:DD:EE:FF\r\n=> ";
 
         assert_eq!(
@@ -2920,6 +2996,7 @@ mod tests {
 
     #[test]
     fn waits_for_line_termination() {
+        let _api_trace = crate::observability::ApiTrace::enter("http", "waits_for_line_termination");
         assert_eq!(
             extract_uboot_mac(b"ethaddr=aa:bb:cc:dd:ee:ff").unwrap(),
             None
@@ -2928,6 +3005,7 @@ mod tests {
 
     #[test]
     fn ignores_command_echo_and_unrelated_output() {
+        let _api_trace = crate::observability::ApiTrace::enter("http", "ignores_command_echo_and_unrelated_output");
         let response = b"\xff\xfe boot noise\r\nprintenv ethaddr\r\n=> ";
 
         assert_eq!(extract_uboot_mac(response).unwrap(), None);
@@ -2935,11 +3013,13 @@ mod tests {
 
     #[test]
     fn rejects_malformed_environment_value() {
+        let _api_trace = crate::observability::ApiTrace::enter("http", "rejects_malformed_environment_value");
         assert!(extract_uboot_mac(b"ethaddr=aa:bb:cc\r\n").is_err());
     }
 
     #[test]
     fn does_not_accept_a_different_variable() {
+        let _api_trace = crate::observability::ApiTrace::enter("http", "does_not_accept_a_different_variable");
         assert_eq!(
             extract_uboot_mac(b"other_ethaddr=aa:bb:cc:dd:ee:ff\r\n").unwrap(),
             None
@@ -2948,6 +3028,7 @@ mod tests {
 
     #[test]
     fn readiness_requires_registration_and_an_open_job_gate() {
+        let _api_trace = crate::observability::ApiTrace::enter("http", "readiness_requires_registration_and_an_open_job_gate");
         assert_eq!(readiness_status(true, false), axum::http::StatusCode::OK);
         assert_eq!(
             readiness_status(false, false),
@@ -2961,6 +3042,7 @@ mod tests {
 
     #[tokio::test]
     async fn gen3_feature_exposes_shared_ipl_without_enabling_gen5() {
+        let _api_trace = crate::observability::ApiTrace::enter("http", "gen3_feature_exposes_shared_ipl_without_enabling_gen5");
         let (base, server) = test_server(
             FeatureFlags {
                 gen3: true,
@@ -2988,6 +3070,7 @@ mod tests {
 
     #[tokio::test]
     async fn gen5_mapping_route_is_rejected_when_only_gen3_is_enabled() {
+        let _api_trace = crate::observability::ApiTrace::enter("http", "gen5_mapping_route_is_rejected_when_only_gen3_is_enabled");
         let (base, server) = test_server(
             FeatureFlags {
                 gen3: true,
@@ -3009,6 +3092,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_paths_use_a_bounded_metrics_label() {
+        let _api_trace = crate::observability::ApiTrace::enter("http", "unknown_paths_use_a_bounded_metrics_label");
         let (base, server) = test_server(FeatureFlags::default(), Generation::Gen4).await;
         let unique_path = "/unknown-path-that-must-not-be-a-label";
         let response = reqwest::get(format!("{base}{unique_path}")).await.unwrap();
@@ -3022,6 +3106,7 @@ mod tests {
 
     #[tokio::test]
     async fn bearer_authentication_rejects_missing_and_invalid_tokens() {
+        let _api_trace = crate::observability::ApiTrace::enter("http", "bearer_authentication_rejects_missing_and_invalid_tokens");
         let token = "0123456789abcdef0123456789abcdef";
         let (base, server) =
             test_server_with_token(FeatureFlags::default(), Generation::Gen4, Some(token)).await;
@@ -3050,6 +3135,7 @@ mod tests {
 
     #[tokio::test]
     async fn admin_control_requires_authentication_and_never_returns_the_token() {
+        let _api_trace = crate::observability::ApiTrace::enter("http", "admin_control_requires_authentication_and_never_returns_the_token");
         let token = "0123456789abcdef0123456789abcdef";
         let (base, server) =
             test_server_with_token(FeatureFlags::default(), Generation::Gen4, Some(token)).await;
@@ -3081,6 +3167,7 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_is_unavailable_before_backend_confirmation() {
+        let _api_trace = crate::observability::ApiTrace::enter("http", "readiness_is_unavailable_before_backend_confirmation");
         let (base, server) = test_server(FeatureFlags::default(), Generation::Gen4).await;
         let response = reqwest::get(format!("{base}/ready")).await.unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
@@ -3094,6 +3181,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_and_status_return_structured_operational_state_without_secrets() {
+        let _api_trace = crate::observability::ApiTrace::enter("http", "health_and_status_return_structured_operational_state_without_secrets");
         let token = "0123456789abcdef0123456789abcdef";
         let features = FeatureFlags {
             gen4: true,
@@ -3141,6 +3229,7 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_endpoint_returns_prometheus_exposition() {
+        let _api_trace = crate::observability::ApiTrace::enter("http", "metrics_endpoint_returns_prometheus_exposition");
         let (base, server) = test_server(FeatureFlags::default(), Generation::Gen4).await;
         let response = reqwest::get(format!("{base}/metrics")).await.unwrap();
 
@@ -3159,6 +3248,7 @@ mod tests {
 
     #[tokio::test]
     async fn openapi_and_swagger_ui_are_accessible_with_correct_media_types() {
+        let _api_trace = crate::observability::ApiTrace::enter("http", "openapi_and_swagger_ui_are_accessible_with_correct_media_types");
         let (base, server) = test_server(FeatureFlags::default(), Generation::Gen4).await;
 
         let contract = reqwest::get(format!("{base}/swagger.json")).await.unwrap();

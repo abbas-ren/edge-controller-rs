@@ -38,6 +38,7 @@ pub const HEADER_PINS: [(u8, u8); 28] = [
 
 /// Return the conventional GPIO character device for a Raspberry Pi model.
 pub fn default_device(raspberry_pi_model: u8) -> &'static str {
+    let _api_trace = crate::observability::ApiTrace::enter("gpio", "default_device");
     match raspberry_pi_model {
         5 => "/dev/gpiochip4",
         _ => "/dev/gpiochip0",
@@ -61,6 +62,7 @@ impl GpioController {
     /// Offsets are gpiochip line offsets, not Raspberry Pi physical header
     /// pin numbers. Confirm the correct gpiochip for your Pi model.
     pub fn set(gpio: u32, value: bool) -> AppResult<()> {
+        let _api_trace = crate::observability::ApiTrace::enter("gpio", "set");
         let value = u8::from(value);
 
         let mut line = LINE
@@ -103,6 +105,7 @@ impl GpioController {
 
     /// Release any retained GPIO line handles.
     pub fn stop() -> AppResult<()> {
+        let _api_trace = crate::observability::ApiTrace::enter("gpio", "stop");
         let mut line = LINE
             .lock()
             .map_err(|_| AppError::Msg("GPIO mutex was poisoned".into()))?;
@@ -119,6 +122,7 @@ mod tests {
 
     #[test]
     fn profiles_use_expected_gpio_devices_and_header_offsets() {
+        let _api_trace = crate::observability::ApiTrace::enter("gpio", "profiles_use_expected_gpio_devices_and_header_offsets");
         assert_eq!(default_device(4), "/dev/gpiochip0");
         assert_eq!(default_device(5), "/dev/gpiochip4");
         assert!(HEADER_PINS.contains(&(11, 17)));
@@ -127,6 +131,7 @@ mod tests {
 
     #[test]
     fn stopping_without_requested_lines_is_idempotent() {
+        let _api_trace = crate::observability::ApiTrace::enter("gpio", "stopping_without_requested_lines_is_idempotent");
         GpioController::stop().unwrap();
         GpioController::stop().unwrap();
     }
